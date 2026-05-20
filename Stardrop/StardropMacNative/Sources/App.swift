@@ -14,7 +14,9 @@ struct StarfruitMacApp: App {
                 .environmentObject(downloadManager)
                 .environmentObject(modManager)
                 .preferredColorScheme(.dark)
+                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
         }
         .windowToolbarStyle(UnifiedWindowToolbarStyle())
+        .handlesExternalEvents(matching: ["*"])
     }
 }

@@ -29,11 +29,29 @@ class NexusClient: ObservableObject {
     private let baseURL = URL(string: "https://api.nexusmods.com/v1/")!
     private var apiKey: String?
     
+    var hasApiKey: Bool {
+        return apiKey != nil && !apiKey!.isEmpty
+    }
+    
+    func getApiKey() -> String? {
+        return apiKey
+    }
+    
     @Published var currentUser: NexusUserResponse?
     @Published var isValidating = false
     
     init() {
         self.apiKey = KeychainHelper.load()
+        if let data = UserDefaults.standard.data(forKey: "nexusCurrentUser"),
+           let user = try? JSONDecoder().decode(NexusUserResponse.self, from: data) {
+            self.currentUser = user
+        }
+        
+        if let key = self.apiKey {
+            Task {
+                _ = await validate(key: key)
+            }
+        }
     }
     
     func validate(key: String) async -> Bool {
@@ -51,6 +69,9 @@ class NexusClient: ObservableObject {
                 self.currentUser = user
                 self.apiKey = key
                 KeychainHelper.save(key)
+                if let encoded = try? JSONEncoder().encode(user) {
+                    UserDefaults.standard.set(encoded, forKey: "nexusCurrentUser")
+                }
             }
             return true
         } catch {
@@ -93,9 +114,29 @@ class NexusClient: ObservableObject {
         }
     }
     
-    func getFileDownloadLink(modID: Int, fileID: Int) async -> URL? {
+    func getFileDownloadLink(modID: Int, fileID: Int, nxmKey: String? = nil, nxmExpires: String? = nil) async -> URL? {
         guard let key = apiKey else { return nil }
-        var request = URLRequest(url: baseURL.appendingPathComponent("games/stardewvalley/mods/\(modID)/files/\(fileID)/download_link.json"))
+        
+        let path = "games/stardewvalley/mods/\(modID)/files/\(fileID)/download_link.json"
+        var url = baseURL.appendingPathComponent(path)
+        
+        var queryItems: [URLQueryItem] = []
+        if let nxmKey = nxmKey {
+            queryItems.append(URLQueryItem(name: "key", value: nxmKey))
+        }
+        if let nxmExpires = nxmExpires {
+            queryItems.append(URLQueryItem(name: "expires", value: nxmExpires))
+        }
+        
+        if !queryItems.isEmpty {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.queryItems = queryItems
+            if let resolvedURL = components?.url {
+                url = resolvedURL
+            }
+        }
+        
+        var request = URLRequest(url: url)
         request.addValue(key, forHTTPHeaderField: "apiKey")
         
         do {
@@ -111,6 +152,7 @@ class NexusClient: ObservableObject {
 
     func logout() {
         KeychainHelper.delete()
+        UserDefaults.standard.removeObject(forKey: "nexusCurrentUser")
         self.apiKey = nil
         self.currentUser = nil
     }

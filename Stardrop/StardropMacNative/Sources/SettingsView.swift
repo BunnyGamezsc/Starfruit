@@ -101,7 +101,7 @@ struct SettingsView: View {
                         Button(action: {
                             Task {
                                 isValidating = true
-                                let success = await nexusClient.validate(key: tempAPIKey)
+                                _ = await nexusClient.validate(key: tempAPIKey)
                                 isValidating = false
                             }
                         }) {
@@ -127,6 +127,68 @@ struct SettingsView: View {
                     .buttonStyle(StarfruitButtonStyle())
                     .help("Scans the original Starfruit app's data folder and imports your existing profiles.")
                 }
+                
+                Divider().background(Color.starfruitBorder)
+                
+                Section(header: Text("Deep Link Debugger").font(.headline).foregroundColor(.starfruitBorder)) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Manually test an NXM link or view received links.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        
+                        HStack {
+                            TextField("Paste nxm:// link here...", text: $testURLText)
+                                .textFieldStyle(.roundedBorder)
+                            
+                            Button("Test Link") {
+                                if let url = URL(string: testURLText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                                    modManager.handleNXMURL(url, nexusClient: nexusClient, downloadManager: downloadManager)
+                                } else {
+                                    modManager.logDeepLink("Error: Invalid URL entered.")
+                                }
+                            }
+                            .buttonStyle(StarfruitButtonStyle())
+                            .disabled(testURLText.isEmpty)
+                        }
+                        
+                        HStack {
+                            Text("Received Link Logs").font(.subheadline).bold()
+                            Spacer()
+                            Button("Clear Logs") {
+                                modManager.clearDeepLinkLogs()
+                            }
+                            .buttonStyle(StarfruitButtonStyle())
+                            .disabled(modManager.deepLinkLogs.isEmpty)
+                        }
+                        
+                        if modManager.deepLinkLogs.isEmpty {
+                            Text("No deep links captured yet.")
+                                .foregroundColor(.secondary)
+                                .font(.caption)
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .background(Color.black.opacity(0.2))
+                                .cornerRadius(6)
+                        } else {
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 4) {
+                                    ForEach(modManager.deepLinkLogs, id: \.self) { log in
+                                        Text(log)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundColor(log.contains("Error:") ? .red : .primary)
+                                            .padding(4)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(Color.black.opacity(log.contains("Error:") ? 0.3 : 0.15))
+                                            .cornerRadius(4)
+                                    }
+                                }
+                            }
+                            .frame(height: 150)
+                            .background(Color.black.opacity(0.1))
+                            .cornerRadius(6)
+                        }
+                    }
+                }
             }
             .padding()
         }
@@ -136,6 +198,8 @@ struct SettingsView: View {
     
     @EnvironmentObject var modManager: ModManager
     @EnvironmentObject var nexusClient: NexusClient
+    @EnvironmentObject var downloadManager: DownloadManager
     @State private var tempAPIKey = ""
+    @State private var testURLText = ""
     @State private var isValidating = false
 }

@@ -70,7 +70,7 @@ struct ContentView: View {
             return true
         }
         .onOpenURL { url in
-            if url.scheme == "nxm" {
+            if url.scheme?.lowercased() == "nxm" {
                 handleNXMURL(url)
             }
         }
@@ -94,23 +94,8 @@ struct ContentView: View {
     }
 
     func handleNXMURL(_ url: URL) {
-        let components = url.pathComponents
-        guard components.count >= 5, 
-              let modID = Int(components[2]),
-              let fileID = Int(components[4]) else { return }
-        
-        Task {
-            if let downloadURL = await nexusClient.getFileDownloadLink(modID: modID, fileID: fileID) {
-                let modDetails = await nexusClient.fetchModDetails(modID: modID)
-                let fileName = modDetails?.name ?? "Mod-\(modID).zip"
-                
-                DispatchQueue.main.async {
-                    let smapiDir = useWine ? wineSmapiDir : nativeSmapiDir
-                    let modsDir = useWine ? wineModsDir : nativeModsDir
-                    downloadManager.startDownload(url: downloadURL, fileName: fileName, modID: modID, smapiDir: smapiDir, customModsDir: modsDir, modManager: modManager)
-                    self.selection = "downloads"
-                }
-            }
+        modManager.handleNXMURL(url, nexusClient: nexusClient, downloadManager: downloadManager) {
+            self.selection = "downloads"
         }
     }
 }
@@ -327,19 +312,121 @@ struct DownloadPanelView: View {
     @EnvironmentObject var downloadManager: DownloadManager
     
     var body: some View {
-        List(downloadManager.activeDownloads) { task in
-            VStack(alignment: .leading) {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Downloads")
+                    .font(.title2.bold())
+                Spacer()
+                Button(action: {
+                    downloadManager.clearCompleted()
+                }) {
+                    Label("Clear Completed", systemImage: "trash")
+                }
+                .buttonStyle(StarfruitButtonStyle())
+                .disabled(downloadManager.activeDownloads.filter { $0.isCompleted || $0.error != nil }.isEmpty)
+            }
+            .padding()
+            .background(Color.starfruitBackground)
+            
+            if downloadManager.activeDownloads.isEmpty {
+                Spacer()
+                Text("No active downloads")
+                    .foregroundColor(.secondary)
+                    .font(.headline)
+                Spacer()
+            } else {
+                List(downloadManager.activeDownloads) { task in
+                    DownloadRowView(task: task)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                }
+                .listStyle(.plain)
+            }
+        }
+    }
+}
+
+struct DownloadRowView: View {
+    let task: DownloadTask
+    
+    var body: some View {
+        HStack(spacing: 16) {
+            Image(systemName: iconForTask)
+                .font(.system(size: 24))
+                .foregroundColor(colorForTask)
+                .frame(width: 40, height: 40)
+                .background(colorForTask.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            
+            VStack(alignment: .leading, spacing: 6) {
                 Text(task.fileName)
                     .font(.headline)
-                ProgressView(value: task.progress)
-                if task.isCompleted {
-                    Text("Completed").foregroundColor(.green)
-                } else if let error = task.error {
-                    Text(error).foregroundColor(.red)
+                    .lineLimit(1)
+                
+                if let error = task.error {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                } else if task.isCompleted {
+                    Text("Download and extraction complete")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                } else if task.isExtracting {
+                    Text("Extracting...")
+                        .font(.caption)
+                        .foregroundColor(.starfruitAccent)
+                } else {
+                    ProgressView(value: task.progress)
+                        .tint(.starfruitAccent)
+                    
+                    HStack {
+                        Text("\(formatBytes(task.downloadedBytes)) / \(formatBytes(task.totalBytes))")
+                        Spacer()
+                        if task.speedBytesPerSecond > 0 {
+                            Text("\(formatBytes(Int64(task.speedBytesPerSecond)))/s • \(formatTime(task.etaSeconds)) left")
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
                 }
             }
-            .padding(.vertical, 4)
         }
-        .navigationTitle("Downloads")
+        .padding(12)
+        .background(Color.starfruitSecondary.opacity(0.5))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(colorForTask.opacity(0.3), lineWidth: 1)
+        )
+    }
+    
+    var iconForTask: String {
+        if task.error != nil { return "exclamationmark.triangle.fill" }
+        if task.isCompleted { return "checkmark.circle.fill" }
+        if task.isExtracting { return "doc.zipper" }
+        return "arrow.down.circle.fill"
+    }
+    
+    var colorForTask: Color {
+        if task.error != nil { return .red }
+        if task.isCompleted { return .green }
+        return .starfruitAccent
+    }
+    
+    func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useAll]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    func formatTime(_ seconds: Double) -> String {
+        guard !seconds.isNaN && !seconds.isInfinite else { return "--s" }
+        if seconds < 60 {
+            return "\(Int(seconds))s"
+        }
+        let mins = Int(seconds) / 60
+        let secs = Int(seconds) % 60
+        return "\(mins)m \(secs)s"
     }
 }

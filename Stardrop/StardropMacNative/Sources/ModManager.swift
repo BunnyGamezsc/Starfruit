@@ -5,6 +5,26 @@ struct ModProfile: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
     var name: String
     var enabledModIDs: Set<String>
+    var isCollectionProfile: Bool = false
+    
+    enum CodingKeys: String, CodingKey {
+        case id, name, enabledModIDs, isCollectionProfile
+    }
+    
+    init(id: UUID = UUID(), name: String, enabledModIDs: Set<String>, isCollectionProfile: Bool = false) {
+        self.id = id
+        self.name = name
+        self.enabledModIDs = enabledModIDs
+        self.isCollectionProfile = isCollectionProfile
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decode(String.self, forKey: .name)
+        enabledModIDs = try container.decode(Set<String>.self, forKey: .enabledModIDs)
+        isCollectionProfile = try container.decodeIfPresent(Bool.self, forKey: .isCollectionProfile) ?? false
+    }
 }
 
 struct ModDependency: Decodable {
@@ -80,16 +100,32 @@ class ModManager: ObservableObject {
     @Published var isGameRunning: Bool = false
     private var statusTimer: Timer?
     
+    var currentProfile: ModProfile? {
+        profiles.first(where: { $0.id == selectedProfileID })
+    }
+    
     var filteredMods: [ModEntry] {
-        if searchText.isEmpty {
-            return mods
+        let current = currentProfile
+        let showCollectionMods = current?.isCollectionProfile ?? false
+        
+        let baseMods: [ModEntry]
+        if showCollectionMods {
+            baseMods = mods
         } else {
-            return mods.filter { $0.manifest.Name.localizedCaseInsensitiveContains(searchText) || $0.manifest.Author.localizedCaseInsensitiveContains(searchText) }
+            // Exclude collection mods (mods inside a "Collections/" folder)
+            baseMods = mods.filter { !$0.folderPath.localizedCaseInsensitiveContains("/Collections/") }
+        }
+        
+        if searchText.isEmpty {
+            return baseMods
+        } else {
+            return baseMods.filter { $0.manifest.Name.localizedCaseInsensitiveContains(searchText) || $0.manifest.Author.localizedCaseInsensitiveContains(searchText) }
         }
     }
     
     init() {
         loadProfiles()
+        loadDeepLinkLogs()
         if profiles.isEmpty {
             let defaultProfile = ModProfile(name: "Default", enabledModIDs: [])
             profiles.append(defaultProfile)
@@ -131,6 +167,138 @@ class ModManager: ObservableObject {
                app.localizedName == "SMAPI Wine" ||
                app.localizedName == "SMAPI" {
                 app.terminate()
+            }
+        }
+    }
+
+    @Published var deepLinkLogs: [String] = []
+
+    private var deepLinkLogsFileURL: URL {
+        let paths = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        let appSupport = paths[0].appendingPathComponent("StarfruitNative", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: appSupport.path) {
+            try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        }
+        return appSupport.appendingPathComponent("deeplinks.log")
+    }
+
+    func logDeepLink(_ message: String) {
+        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .medium)
+        let logLine = "[\(timestamp)] \(message)"
+        print("[DeepLinkLog] \(logLine)")
+        
+        DispatchQueue.main.async {
+            self.deepLinkLogs.insert(logLine, at: 0)
+        }
+        
+        // Write to log file
+        if let data = (logLine + "\n").data(using: .utf8) {
+            if let fileHandle = try? FileHandle(forWritingTo: deepLinkLogsFileURL) {
+                fileHandle.seekToEndOfFile()
+                fileHandle.write(data)
+                fileHandle.closeFile()
+            } else {
+                try? data.write(to: deepLinkLogsFileURL)
+            }
+        }
+    }
+
+    func loadDeepLinkLogs() {
+        if let content = try? String(contentsOf: deepLinkLogsFileURL, encoding: .utf8) {
+            let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }.reversed()
+            DispatchQueue.main.async {
+                self.deepLinkLogs = Array(lines)
+            }
+        }
+    }
+
+    func clearDeepLinkLogs() {
+        try? "".write(to: deepLinkLogsFileURL, atomically: true, encoding: .utf8)
+        DispatchQueue.main.async {
+            self.deepLinkLogs = []
+        }
+    }
+
+    func handleNXMURL(_ url: URL, nexusClient: NexusClient, downloadManager: DownloadManager, completion: (() -> Void)? = nil) {
+        logDeepLink("Processing deep link: \(url.absoluteString)")
+        
+        var nxmKey: String? = nil
+        var nxmExpires: String? = nil
+        
+        // Log query parameters for debugging
+        if let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            let queryItems = components.queryItems ?? []
+            nxmKey = queryItems.first(where: { $0.name == "key" })?.value
+            nxmExpires = queryItems.first(where: { $0.name == "expires" })?.value
+            
+            let queryMap = queryItems.reduce(into: [String: String]()) { $0[$1.name] = $1.value }
+            logDeepLink("Query parameters: \(queryMap.description)")
+        }
+        
+        let pathComponents = url.pathComponents
+        logDeepLink("Path components: \(pathComponents.description)")
+        
+        if pathComponents.contains("collections") || pathComponents.contains("collection") {
+            handleNXMCollectionURL(url, nexusClient: nexusClient, downloadManager: downloadManager, completion: completion)
+            return
+        }
+        
+        // Check if user is logged in / has API key
+        guard nexusClient.hasApiKey else {
+            logDeepLink("Error: No Nexus API key found. Please connect your Nexus Mods account in Settings first.")
+            return
+        }
+        
+        guard let modsIndex = pathComponents.firstIndex(of: "mods"),
+              modsIndex + 1 < pathComponents.count,
+              let modID = Int(pathComponents[modsIndex + 1]) else {
+            logDeepLink("Error: Could not parse Mod ID from path components: \(pathComponents.description)")
+            return
+        }
+        
+        guard let filesIndex = pathComponents.firstIndex(of: "files"),
+              filesIndex + 1 < pathComponents.count,
+              let fileID = Int(pathComponents[filesIndex + 1]) else {
+            logDeepLink("Error: Could not parse File ID from path components: \(pathComponents.description)")
+            return
+        }
+        
+        logDeepLink("Successfully parsed Mod ID: \(modID), File ID: \(fileID)")
+        
+        Task {
+            logDeepLink("Requesting download link from Nexus API (with key & expires tokens)...")
+            if let downloadURL = await nexusClient.getFileDownloadLink(modID: modID, fileID: fileID, nxmKey: nxmKey, nxmExpires: nxmExpires) {
+                logDeepLink("Download link received: \(downloadURL.absoluteString)")
+                
+                logDeepLink("Fetching mod details for naming...")
+                let modDetails = await nexusClient.fetchModDetails(modID: modID)
+                let name = modDetails?.name ?? "Mod-\(modID)"
+                let version = modDetails?.version ?? "1.0"
+                // Clean filename
+                let fileName = "\(name)-\(version).zip".replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+                logDeepLink("Target filename: \(fileName)")
+                
+                // Retrieve paths from User Defaults
+                let useWine = UserDefaults.standard.bool(forKey: "useWine")
+                let nativeSmapiDir = UserDefaults.standard.string(forKey: "nativeSmapiDir") ?? "/Applications/Stardew Valley.app/Contents/MacOS"
+                let nativeModsDir = UserDefaults.standard.string(forKey: "nativeModsDir") ?? ""
+                let wineSmapiDir = UserDefaults.standard.string(forKey: "wineSmapiDir") ?? ""
+                let wineModsDir = UserDefaults.standard.string(forKey: "wineModsDir") ?? ""
+                
+                let smapiDir = useWine ? wineSmapiDir : nativeSmapiDir
+                let modsDir = useWine ? wineModsDir : nativeModsDir
+                
+                logDeepLink("Starting download with parameters:")
+                logDeepLink("  - SMAPI Dir: \(smapiDir)")
+                logDeepLink("  - Mods Dir: \(modsDir)")
+                logDeepLink("  - File: \(fileName)")
+                
+                DispatchQueue.main.async {
+                    downloadManager.startDownload(url: downloadURL, fileName: fileName, modID: modID, smapiDir: smapiDir, customModsDir: modsDir, modManager: self)
+                    completion?()
+                }
+            } else {
+                logDeepLink("Error: Nexus API returned nil download link. Your API key might be expired, or you might need a Premium account if the file requires it, or the API returned a 403/404.")
             }
         }
     }
@@ -281,7 +449,7 @@ class ModManager: ObservableObject {
 
     func prepareProfileForLaunch(smapiDir: String, customModsDir: String) -> String? {
         guard let profileID = selectedProfileID, 
-              let profile = profiles.first(where: { $0.id == profileID }) else { return nil }
+              profiles.contains(where: { $0.id == profileID }) else { return nil }
         
         let paths = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
         let stagingDir = paths[0].appendingPathComponent("StarfruitNativeStagingMods", isDirectory: true)
@@ -370,17 +538,63 @@ class ModManager: ObservableObject {
         }
     }
 
-    func installMod(zipURL: URL, smapiDir: String, customModsDir: String) {
+    func installMod(zipURL: URL, smapiDir: String, customModsDir: String, collectionFolder: String? = nil, autoEnableInProfileID: UUID? = nil) {
         let modsPath = getModDirectory(smapiDir: smapiDir, customModsDir: customModsDir)
+        let destinationPath: URL
+        if let collectionFolder = collectionFolder {
+            destinationPath = modsPath.appendingPathComponent(collectionFolder)
+            try? FileManager.default.createDirectory(at: destinationPath, withIntermediateDirectories: true)
+        } else {
+            destinationPath = modsPath
+        }
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        task.arguments = ["-o", "-q", zipURL.path, "-d", modsPath.path]
+        task.arguments = ["-o", "-q", zipURL.path, "-d", destinationPath.path]
 
         do {
             try task.run()
             task.waitUntilExit()
             loadMods(smapiDir: smapiDir, customModsDir: customModsDir)
+            
+            if let profileID = autoEnableInProfileID {
+                let fileManager = FileManager.default
+                let enumerator = fileManager.enumerator(at: destinationPath, includingPropertiesForKeys: nil)
+                var extractedIDs: [String] = []
+                while let fileURL = enumerator?.nextObject() as? URL {
+                    if fileURL.lastPathComponent.lowercased() == "manifest.json",
+                       let rawData = try? Data(contentsOf: fileURL) {
+                        var jsonString = String(data: rawData, encoding: .utf8) ?? String(data: rawData, encoding: .isoLatin1) ?? ""
+                        jsonString = jsonString.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+                        let blockCommentPattern = "/\\*[\\s\\S]*?\\*/"
+                        if let blockRegex = try? NSRegularExpression(pattern: blockCommentPattern) {
+                            let range = NSRange(jsonString.startIndex..., in: jsonString)
+                            jsonString = blockRegex.stringByReplacingMatches(in: jsonString, range: range, withTemplate: "")
+                        }
+                        let lines = jsonString.components(separatedBy: .newlines)
+                        jsonString = lines.filter { line in
+                            let trimmed = line.trimmingCharacters(in: .whitespaces)
+                            return !trimmed.hasPrefix("//")
+                        }.joined(separator: "\n")
+                        jsonString = jsonString.replacingOccurrences(of: "\"$schema\"", with: "\"_schema\"")
+                        
+                        if let strippedData = jsonString.data(using: .utf8),
+                           let manifest = try? JSONDecoder().decode(ModManifest.self, from: strippedData) {
+                            extractedIDs.append(manifest.UniqueID)
+                        }
+                    }
+                }
+                
+                if !extractedIDs.isEmpty,
+                   let pIdx = self.profiles.firstIndex(where: { $0.id == profileID }) {
+                    DispatchQueue.main.async {
+                        for id in extractedIDs {
+                            self.profiles[pIdx].enabledModIDs.insert(id)
+                        }
+                        self.saveProfiles()
+                    }
+                }
+            }
         } catch {
             print("Failed to extract zip: \(error)")
         }
@@ -396,5 +610,214 @@ class ModManager: ObservableObject {
                 }
             }
         }
+    }
+    
+    func handleNXMCollectionURL(_ url: URL, nexusClient: NexusClient, downloadManager: DownloadManager, completion: (() -> Void)? = nil) {
+        logDeepLink("Processing collection deep link: \(url.absoluteString)")
+        
+        let pathComponents = url.pathComponents
+        
+        guard let collectionsIndex = pathComponents.firstIndex(where: { $0 == "collections" || $0 == "collection" }),
+              collectionsIndex + 1 < pathComponents.count else {
+            logDeepLink("Error: Could not parse collection slug from path components: \(pathComponents.description)")
+            return
+        }
+        let slug = pathComponents[collectionsIndex + 1]
+        
+        var revision: Int = 1
+        if let revisionsIndex = pathComponents.firstIndex(where: { $0 == "revisions" || $0 == "revision" }),
+           revisionsIndex + 1 < pathComponents.count,
+           let parsedRevision = Int(pathComponents[revisionsIndex + 1]) {
+            revision = parsedRevision
+        }
+        
+        logDeepLink("Parsed Collection Slug: \(slug), Revision: \(revision)")
+        
+        Task {
+            logDeepLink("Fetching collection revision mods via Nexus GraphQL API...")
+            do {
+                let (collectionName, modFiles) = try await fetchCollectionRevisionMods(slug: slug, revision: revision, nexusClient: nexusClient)
+                logDeepLink("GraphQL Request successful. Collection Name: '\(collectionName)'. Found \(modFiles.count) files.")
+                
+                for (index, fileEntry) in modFiles.enumerated() {
+                    let modName = fileEntry.file?.mod?.name ?? "Unknown Mod"
+                    let modId = fileEntry.file?.mod?.modId ?? 0
+                    let fileId = fileEntry.fileId
+                    let optionalStr = fileEntry.optional ? " (Optional)" : ""
+                    logDeepLink("  [\(index + 1)] Mod: \(modName) (ID: \(modId)), File ID: \(fileId)\(optionalStr)")
+                }
+                
+                // Create a special collection profile if it doesn't exist
+                let profileName = "Collection: \(collectionName)"
+                var targetProfileID: UUID
+                
+                if let existingProfile = self.profiles.first(where: { $0.name == profileName }) {
+                    targetProfileID = existingProfile.id
+                    logDeepLink("Using existing profile: '\(profileName)'")
+                } else {
+                    let newProfile = ModProfile(name: profileName, enabledModIDs: [], isCollectionProfile: true)
+                    targetProfileID = newProfile.id
+                    DispatchQueue.main.async {
+                        self.profiles.append(newProfile)
+                        self.selectedProfileID = targetProfileID
+                        self.saveProfiles()
+                    }
+                    logDeepLink("Created new special collection profile: '\(profileName)'")
+                }
+                
+                // If it is the test collection slug, skip downloading as requested by user
+                if slug == "tckf0m" {
+                    logDeepLink("Info: Dry-run active for test modpack 'tckf0m'. Skipped downloading 400MB collection files as requested.")
+                    return
+                }
+                
+                let essentialFiles = modFiles.filter { !$0.optional }
+                logDeepLink("Starting queue for \(essentialFiles.count) essential mods...")
+                
+                let useWine = UserDefaults.standard.bool(forKey: "useWine")
+                let nativeSmapiDir = UserDefaults.standard.string(forKey: "nativeSmapiDir") ?? "/Applications/Stardew Valley.app/Contents/MacOS"
+                let nativeModsDir = UserDefaults.standard.string(forKey: "nativeModsDir") ?? ""
+                let wineSmapiDir = UserDefaults.standard.string(forKey: "wineSmapiDir") ?? ""
+                let wineModsDir = UserDefaults.standard.string(forKey: "wineModsDir") ?? ""
+                
+                let smapiDir = useWine ? wineSmapiDir : nativeSmapiDir
+                let modsDir = useWine ? wineModsDir : nativeModsDir
+                
+                // Download into Collections/slug/ folder
+                let collectionFolder = "Collections/\(slug)"
+                
+                for fileEntry in essentialFiles {
+                    guard let fileDetail = fileEntry.file,
+                          let modDetail = fileDetail.mod else { continue }
+                    
+                    let modID = modDetail.modId
+                    let fileID = fileDetail.fileId
+                    let originalName = fileDetail.name
+                    
+                    let fileName = originalName.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+                    
+                    logDeepLink("Queueing: \(fileName) (Mod: \(modID), File: \(fileID))")
+                    
+                    if let downloadURL = await nexusClient.getFileDownloadLink(modID: modID, fileID: fileID) {
+                        DispatchQueue.main.async {
+                            downloadManager.startDownload(
+                                url: downloadURL,
+                                fileName: fileName,
+                                modID: modID,
+                                smapiDir: smapiDir,
+                                customModsDir: modsDir,
+                                modManager: self,
+                                collectionFolder: collectionFolder,
+                                autoEnableInProfileID: targetProfileID
+                            )
+                        }
+                    } else {
+                        logDeepLink("  Error: Could not retrieve download URL for \(fileName)")
+                    }
+                }
+                
+                DispatchQueue.main.async {
+                    completion?()
+                }
+                
+            } catch {
+                logDeepLink("Error: GraphQL collection fetch failed: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    private func fetchCollectionRevisionMods(slug: String, revision: Int, nexusClient: NexusClient) async throws -> (name: String, files: [GraphQLResponse.ModFileEntry]) {
+        let url = URL(string: "https://api.nexusmods.com/v2/graphql")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.addValue("application/json", forHTTPHeaderField: "Accept")
+        
+        if let key = nexusClient.getApiKey() {
+            request.addValue(key, forHTTPHeaderField: "apiKey")
+        }
+        
+        let query = """
+        query CollectionData($revision: Int!, $slug: String!, $viewAdultContent: Boolean) {
+            collection(slug: $slug) {
+                name
+            }
+            collectionRevision(revision: $revision, slug: $slug, viewAdultContent: $viewAdultContent) {
+                modFiles {
+                    fileId
+                    optional
+                    file {
+                        fileId
+                        name
+                        mod {
+                            modId
+                            name
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        let variables: [String: Any] = [
+            "revision": revision,
+            "slug": slug,
+            "viewAdultContent": true
+        ]
+        
+        let payload: [String: Any] = [
+            "query": query,
+            "variables": variables,
+            "operationName": "CollectionData"
+        ]
+        
+        let jsonData = try JSONSerialization.data(withJSONObject: payload, options: [])
+        request.httpBody = jsonData
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw NSError(domain: "GraphQL", code: code, userInfo: [NSLocalizedDescriptionKey: "Server returned status code \(code)"])
+        }
+        
+        let decoded = try JSONDecoder().decode(GraphQLResponse.self, from: data)
+        let collectionName = decoded.data?.collection?.name ?? "Collection \(slug)"
+        let modFiles = decoded.data?.collectionRevision?.modFiles ?? []
+        return (collectionName, modFiles)
+    }
+}
+
+struct GraphQLResponse: Codable {
+    let data: GraphQLData?
+    
+    struct GraphQLData: Codable {
+        let collection: CollectionInfo?
+        let collectionRevision: CollectionRevision?
+    }
+    
+    struct CollectionInfo: Codable {
+        let name: String
+    }
+    
+    struct CollectionRevision: Codable {
+        let modFiles: [ModFileEntry]?
+    }
+    
+    struct ModFileEntry: Codable {
+        let fileId: Int
+        let optional: Bool
+        let file: FileDetail?
+    }
+    
+    struct FileDetail: Codable {
+        let fileId: Int
+        let name: String
+        let mod: ModDetail?
+    }
+    
+    struct ModDetail: Codable {
+        let modId: Int
+        let name: String
     }
 }
