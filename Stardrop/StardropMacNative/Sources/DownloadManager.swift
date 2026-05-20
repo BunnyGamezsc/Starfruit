@@ -6,6 +6,7 @@ struct DownloadTask: Identifiable {
     let id = UUID()
     let fileName: String
     let modID: Int
+    var fileID: Int? = nil
     var progress: Double = 0.0
     var downloadedBytes: Int64 = 0
     var totalBytes: Int64 = 0
@@ -14,6 +15,7 @@ struct DownloadTask: Identifiable {
     var isExtracting: Bool = false
     var error: String?
     let startTime: Date = Date()
+    var manualDownloadURL: URL? = nil
     
     // Internal tracking
     var urlSessionTaskID: Int?
@@ -41,26 +43,63 @@ class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDelegate {
         self.session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
     }
     
-    func startDownload(url: URL, fileName: String, modID: Int, smapiDir: String, customModsDir: String, modManager: ModManager, collectionFolder: String? = nil, autoEnableInProfileID: UUID? = nil) {
+    func startOrResumeDownload(url: URL, fileName: String, modID: Int, fileID: Int? = nil, smapiDir: String, customModsDir: String, modManager: ModManager, collectionFolder: String? = nil, autoEnableInProfileID: UUID? = nil) {
         if self.modManager == nil {
             self.modManager = modManager
         }
         
         let urlTask = session.downloadTask(with: url)
         
-        var task = DownloadTask(fileName: fileName, modID: modID)
-        task.urlSessionTaskID = urlTask.taskIdentifier
-        task.smapiDir = smapiDir
-        task.customModsDir = customModsDir
-        task.collectionFolder = collectionFolder
-        task.autoEnableInProfileID = autoEnableInProfileID
+        // Find if there is an existing manual task matching this modID and fileID
+        if let index = activeDownloads.firstIndex(where: { $0.modID == modID && ($0.fileID == fileID || $0.fileID == nil) && $0.manualDownloadURL != nil }) {
+            activeDownloads[index].manualDownloadURL = nil
+            activeDownloads[index].error = nil
+            activeDownloads[index].urlSessionTaskID = urlTask.taskIdentifier
+            activeDownloads[index].progress = 0.0
+            activeDownloads[index].downloadedBytes = 0
+            activeDownloads[index].totalBytes = 0
+            activeDownloads[index].speedBytesPerSecond = 0
+            
+            // Retain the collection-specific folders and profiles
+            if activeDownloads[index].smapiDir.isEmpty {
+                activeDownloads[index].smapiDir = smapiDir
+            }
+            if activeDownloads[index].customModsDir.isEmpty {
+                activeDownloads[index].customModsDir = customModsDir
+            }
+            if activeDownloads[index].collectionFolder == nil {
+                activeDownloads[index].collectionFolder = collectionFolder
+            }
+            if activeDownloads[index].autoEnableInProfileID == nil {
+                activeDownloads[index].autoEnableInProfileID = autoEnableInProfileID
+            }
+        } else {
+            var task = DownloadTask(fileName: fileName, modID: modID, fileID: fileID)
+            task.urlSessionTaskID = urlTask.taskIdentifier
+            task.smapiDir = smapiDir
+            task.customModsDir = customModsDir
+            task.collectionFolder = collectionFolder
+            task.autoEnableInProfileID = autoEnableInProfileID
+            
+            activeDownloads.append(task)
+        }
         
-        activeDownloads.append(task)
         urlTask.resume()
     }
     
     func clearCompleted() {
         activeDownloads.removeAll { $0.isCompleted || $0.error != nil }
+    }
+    
+    func addManualDownload(fileName: String, modID: Int, fileID: Int? = nil, manualURL: URL?, errorMsg: String?, smapiDir: String = "", customModsDir: String = "", collectionFolder: String? = nil, autoEnableInProfileID: UUID? = nil) {
+        var task = DownloadTask(fileName: fileName, modID: modID, fileID: fileID)
+        task.manualDownloadURL = manualURL
+        task.error = errorMsg ?? "Premium membership required for automatic download."
+        task.smapiDir = smapiDir
+        task.customModsDir = customModsDir
+        task.collectionFolder = collectionFolder
+        task.autoEnableInProfileID = autoEnableInProfileID
+        activeDownloads.append(task)
     }
     
     // MARK: - URLSessionDownloadDelegate

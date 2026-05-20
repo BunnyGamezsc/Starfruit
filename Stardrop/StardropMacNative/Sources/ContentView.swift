@@ -363,7 +363,20 @@ struct DownloadRowView: View {
                     .font(.headline)
                     .lineLimit(1)
                 
-                if let error = task.error {
+                if let manualURL = task.manualDownloadURL {
+                    HStack {
+                        Text(task.error ?? "Requires Manual Download")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                        Spacer()
+                        Button(action: {
+                            NSWorkspace.shared.open(manualURL)
+                        }) {
+                            Label("Download Manually", systemImage: "safari")
+                        }
+                        .buttonStyle(StarfruitButtonStyle())
+                    }
+                } else if let error = task.error {
                     Text(error)
                         .font(.caption)
                         .foregroundColor(.red)
@@ -401,6 +414,7 @@ struct DownloadRowView: View {
     }
     
     var iconForTask: String {
+        if task.manualDownloadURL != nil { return "safari" }
         if task.error != nil { return "exclamationmark.triangle.fill" }
         if task.isCompleted { return "checkmark.circle.fill" }
         if task.isExtracting { return "doc.zipper" }
@@ -408,6 +422,7 @@ struct DownloadRowView: View {
     }
     
     var colorForTask: Color {
+        if task.manualDownloadURL != nil { return .orange }
         if task.error != nil { return .red }
         if task.isCompleted { return .green }
         return .starfruitAccent

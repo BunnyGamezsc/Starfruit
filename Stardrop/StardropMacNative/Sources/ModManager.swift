@@ -92,6 +92,7 @@ struct ModEntry: Identifiable {
     var hasUpdate: Bool = false
 }
 
+@MainActor
 class ModManager: ObservableObject {
     @Published var mods: [ModEntry] = []
     @Published var profiles: [ModProfile] = []
@@ -141,7 +142,7 @@ class ModManager: ObservableObject {
         }
     }
     
-    func checkGameStatus() {
+    nonisolated func checkGameStatus() {
         let runningApps = NSWorkspace.shared.runningApplications
         var isRunning = false
         for app in runningApps {
@@ -153,7 +154,7 @@ class ModManager: ObservableObject {
             }
         }
         
-        DispatchQueue.main.async {
+        Task { @MainActor in
             if self.isGameRunning != isRunning {
                 self.isGameRunning = isRunning
             }
@@ -267,7 +268,8 @@ class ModManager: ObservableObject {
         
         Task {
             logDeepLink("Requesting download link from Nexus API (with key & expires tokens)...")
-            if let downloadURL = await nexusClient.getFileDownloadLink(modID: modID, fileID: fileID, nxmKey: nxmKey, nxmExpires: nxmExpires) {
+            let (downloadURL, errorMsg) = await nexusClient.getFileDownloadLink(modID: modID, fileID: fileID, nxmKey: nxmKey, nxmExpires: nxmExpires)
+            if let downloadURL = downloadURL {
                 logDeepLink("Download link received: \(downloadURL.absoluteString)")
                 
                 logDeepLink("Fetching mod details for naming...")
@@ -294,11 +296,11 @@ class ModManager: ObservableObject {
                 logDeepLink("  - File: \(fileName)")
                 
                 DispatchQueue.main.async {
-                    downloadManager.startDownload(url: downloadURL, fileName: fileName, modID: modID, smapiDir: smapiDir, customModsDir: modsDir, modManager: self)
+                    downloadManager.startOrResumeDownload(url: downloadURL, fileName: fileName, modID: modID, fileID: fileID, smapiDir: smapiDir, customModsDir: modsDir, modManager: self)
                     completion?()
                 }
             } else {
-                logDeepLink("Error: Nexus API returned nil download link. Your API key might be expired, or you might need a Premium account if the file requires it, or the API returned a 403/404.")
+                logDeepLink("Error: \(errorMsg ?? "Unknown error occurred requesting download link")")
             }
         }
     }
@@ -440,7 +442,7 @@ class ModManager: ObservableObject {
         return disabled
     }
 
-    private func getModDirectory(smapiDir: String, customModsDir: String) -> URL {
+    nonisolated private func getModDirectory(smapiDir: String, customModsDir: String) -> URL {
         if !customModsDir.isEmpty {
             return URL(fileURLWithPath: SMAPILauncher.resolvePath(customModsDir))
         }
@@ -538,7 +540,7 @@ class ModManager: ObservableObject {
         }
     }
 
-    func installMod(zipURL: URL, smapiDir: String, customModsDir: String, collectionFolder: String? = nil, autoEnableInProfileID: UUID? = nil) {
+    nonisolated func installMod(zipURL: URL, smapiDir: String, customModsDir: String, collectionFolder: String? = nil, autoEnableInProfileID: UUID? = nil) {
         let modsPath = getModDirectory(smapiDir: smapiDir, customModsDir: customModsDir)
         let destinationPath: URL
         if let collectionFolder = collectionFolder {
@@ -555,7 +557,10 @@ class ModManager: ObservableObject {
         do {
             try task.run()
             task.waitUntilExit()
-            loadMods(smapiDir: smapiDir, customModsDir: customModsDir)
+            
+            Task { @MainActor in
+                self.loadMods(smapiDir: smapiDir, customModsDir: customModsDir)
+            }
             
             if let profileID = autoEnableInProfileID {
                 let fileManager = FileManager.default
@@ -585,13 +590,14 @@ class ModManager: ObservableObject {
                     }
                 }
                 
-                if !extractedIDs.isEmpty,
-                   let pIdx = self.profiles.firstIndex(where: { $0.id == profileID }) {
-                    DispatchQueue.main.async {
-                        for id in extractedIDs {
-                            self.profiles[pIdx].enabledModIDs.insert(id)
+                if !extractedIDs.isEmpty {
+                    Task { @MainActor in
+                        if let pIdx = self.profiles.firstIndex(where: { $0.id == profileID }) {
+                            for id in extractedIDs {
+                                self.profiles[pIdx].enabledModIDs.insert(id)
+                            }
+                            self.saveProfiles()
                         }
-                        self.saveProfiles()
                     }
                 }
             }
@@ -698,12 +704,14 @@ class ModManager: ObservableObject {
                     
                     logDeepLink("Queueing: \(fileName) (Mod: \(modID), File: \(fileID))")
                     
-                    if let downloadURL = await nexusClient.getFileDownloadLink(modID: modID, fileID: fileID) {
+                    let (downloadURL, errorMsg) = await nexusClient.getFileDownloadLink(modID: modID, fileID: fileID)
+                    if let downloadURL = downloadURL {
                         DispatchQueue.main.async {
-                            downloadManager.startDownload(
+                            downloadManager.startOrResumeDownload(
                                 url: downloadURL,
                                 fileName: fileName,
                                 modID: modID,
+                                fileID: fileID,
                                 smapiDir: smapiDir,
                                 customModsDir: modsDir,
                                 modManager: self,
@@ -712,7 +720,21 @@ class ModManager: ObservableObject {
                             )
                         }
                     } else {
-                        logDeepLink("  Error: Could not retrieve download URL for \(fileName)")
+                        logDeepLink("  Error: Could not retrieve download URL for \(fileName): \(errorMsg ?? "Unknown error")")
+                        let manualURL = URL(string: "https://www.nexusmods.com/stardewvalley/mods/\(modID)?tab=files&file_id=\(fileID)&nmm=1")
+                        DispatchQueue.main.async {
+                            downloadManager.addManualDownload(
+                                fileName: fileName,
+                                modID: modID,
+                                fileID: fileID,
+                                manualURL: manualURL,
+                                errorMsg: errorMsg,
+                                smapiDir: smapiDir,
+                                customModsDir: modsDir,
+                                collectionFolder: collectionFolder,
+                                autoEnableInProfileID: targetProfileID
+                            )
+                        }
                     }
                 }
                 

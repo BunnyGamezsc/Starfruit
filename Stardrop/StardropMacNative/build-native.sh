@@ -30,6 +30,8 @@ cat > "Starfruit.app/Contents/Info.plist" <<EOF
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 BunnyGamez. Licensed under GPLv3.</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>

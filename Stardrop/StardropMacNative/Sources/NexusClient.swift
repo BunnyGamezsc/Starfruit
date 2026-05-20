@@ -25,6 +25,7 @@ struct NexusFilesResponse: Codable {
     let files: [NexusFile]
 }
 
+@MainActor
 class NexusClient: ObservableObject {
     private let baseURL = URL(string: "https://api.nexusmods.com/v1/")!
     private var apiKey: String?
@@ -41,6 +42,9 @@ class NexusClient: ObservableObject {
     @Published var isValidating = false
     
     init() {
+        // Clean up legacy fallback key if it exists in UserDefaults
+        UserDefaults.standard.removeObject(forKey: "nexus-api-key-fallback")
+        
         self.apiKey = KeychainHelper.load()
         if let data = UserDefaults.standard.data(forKey: "nexusCurrentUser"),
            let user = try? JSONDecoder().decode(NexusUserResponse.self, from: data) {
@@ -114,8 +118,8 @@ class NexusClient: ObservableObject {
         }
     }
     
-    func getFileDownloadLink(modID: Int, fileID: Int, nxmKey: String? = nil, nxmExpires: String? = nil) async -> URL? {
-        guard let key = apiKey else { return nil }
+    func getFileDownloadLink(modID: Int, fileID: Int, nxmKey: String? = nil, nxmExpires: String? = nil) async -> (URL?, String?) {
+        guard let key = apiKey else { return (nil, "No API key found") }
         
         let path = "games/stardewvalley/mods/\(modID)/files/\(fileID)/download_link.json"
         var url = baseURL.appendingPathComponent(path)
@@ -140,13 +144,23 @@ class NexusClient: ObservableObject {
         request.addValue(key, forHTTPHeaderField: "apiKey")
         
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let httpResponse = response as? HTTPURLResponse
+            let statusCode = httpResponse?.statusCode ?? 0
+            
+            if statusCode != 200 {
+                let body = String(data: data, encoding: .utf8) ?? "No body"
+                return (nil, "HTTP \(statusCode): \(body)")
+            }
+            
             struct DownloadLink: Codable { let URI: String }
             let links = try JSONDecoder().decode([DownloadLink].self, from: data)
-            return URL(string: links.first?.URI ?? "")
+            guard let firstURI = links.first?.URI, let finalURL = URL(string: firstURI) else {
+                return (nil, "Empty or invalid download links array")
+            }
+            return (finalURL, nil)
         } catch {
-            print("Error fetching download link: \(error)")
-            return nil
+            return (nil, error.localizedDescription)
         }
     }
 
