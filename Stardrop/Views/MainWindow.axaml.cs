@@ -391,7 +391,7 @@ namespace Stardrop.Views
             {
                 SMAPI.Process = Process.GetProcessesByName(SMAPI.GetProcessName()).FirstOrDefault();
             }
-            else if (SMAPI.Process.HasExited || Process.GetProcessesByName(SMAPI.GetProcessName()).FirstOrDefault() is null)
+            else if (SMAPI.Process.HasExited || (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && Process.GetProcessesByName(SMAPI.GetProcessName()).FirstOrDefault() is null))
             {
                 Program.helper.Log("SMAPI has exited, restoring Stardrop", Helper.Status.Debug);
 

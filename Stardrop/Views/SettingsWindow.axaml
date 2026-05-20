@@ -190,6 +190,10 @@
 					<TextBlock Text="{i18n:Translate ui.settings_window.labels.mod_install}" Margin="0 10 0 0" VerticalAlignment="Center" HorizontalAlignment="Left" Foreground="{DynamicResource ThemeForegroundBrush}" />
 					<TextBox Name="modInstallPathBox" Text="{Binding ModInstallPath}" ToolTip.Tip="{Binding ToolTip_ModInstall}" Margin="10 10 0 0" Height="10" Width="350" BorderBrush="{DynamicResource HighlightBrush}" HorizontalAlignment="Left"/>
 					<Button Name="modInstallButton" Margin="360 -32 0 0" i:Attached.Icon="mdi-folder" Foreground="{DynamicResource ThemeForegroundBrush}" Background="Transparent" HorizontalAlignment="Left" />
+
+					<TextBlock Text="Wine Prefix Path" Margin="0 10 0 0" VerticalAlignment="Center" HorizontalAlignment="Left" Foreground="{DynamicResource ThemeForegroundBrush}" />
+					<TextBox Name="winePrefixPathBox" Text="{Binding WinePrefixPath}" ToolTip.Tip="{Binding ToolTip_WinePrefixPath}" Margin="10 10 0 0" Height="10" Width="350" BorderBrush="{DynamicResource HighlightBrush}" HorizontalAlignment="Left"/>
+					<Button Name="winePrefixButton" Margin="360 -32 0 0" i:Attached.Icon="mdi-folder" Foreground="{DynamicResource ThemeForegroundBrush}" Background="Transparent" HorizontalAlignment="Left" />
 				</StackPanel>
 
 				<StackPanel Margin="10 10 0 0">

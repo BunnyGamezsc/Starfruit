@@ -37,6 +37,7 @@ namespace Stardrop.Views
             this.FindControl<Button>("smapiFolderButton").Click += SmapiFolderButton_Click;
             this.FindControl<Button>("modFolderButton").Click += ModFolderButton_Click;
             this.FindControl<Button>("modInstallButton").Click += ModInstallButton_Click;
+            this.FindControl<Button>("winePrefixButton").Click += WinePrefixButton_Click;
             this.FindControl<Button>("registerNXMButton").Click += RegisterNXMButton_Click;
             this.FindControl<Button>("applyButton").Click += ApplyButton_Click;
 
@@ -275,6 +276,25 @@ namespace Stardrop.Views
             if (!String.IsNullOrEmpty(folderPath))
             {
                 SetTextboxTextFocusToEnd(this.FindControl<TextBox>("modInstallPathBox"), folderPath);
+            }
+        }
+
+        private async void WinePrefixButton_Click(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        {
+            OpenFolderDialog dialog = new OpenFolderDialog()
+            {
+                Title = "Select the WinePrefix folder"
+            };
+
+            if (!String.IsNullOrEmpty(Program.settings.WinePrefixPath))
+            {
+                dialog.Directory = Program.settings.WinePrefixPath;
+            }
+
+            var folderPath = await dialog.ShowAsync(this);
+            if (!String.IsNullOrEmpty(folderPath))
+            {
+                SetTextboxTextFocusToEnd(this.FindControl<TextBox>("winePrefixPathBox"), folderPath);
             }
         }
 

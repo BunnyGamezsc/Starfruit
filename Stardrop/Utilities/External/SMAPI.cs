@@ -1,4 +1,4 @@
-﻿using Semver;
+using Semver;
 using Stardrop.Models;
 using Stardrop.Models.SMAPI;
 using Stardrop.Models.SMAPI.Web;
@@ -36,10 +36,31 @@ namespace Stardrop.Utilities.External
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) is true)
             {
-                fileName = "/usr/bin/open";
-                arguments = $"-a \"Terminal\" \"{Pathing.GetSmapiPath().Replace("StardewModdingAPI.dll", "StardewModdingAPI")}\" --args --mods-path \"{Pathing.GetSelectedModsFolderPath()}\"";
-                parsedModPath = $"{Pathing.GetSelectedModsFolderPath()}";
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                var resourcesDir = Path.GetFullPath(Path.Combine(baseDir, "..", "Resources"));
+                var targetDir = Directory.Exists(resourcesDir) ? resourcesDir : baseDir;
+                
+                var appPath = Path.Combine(targetDir, "SMAPI-Wine.app");
+                var macosPath = Path.Combine(appPath, "Contents", "MacOS");
+                if (!Directory.Exists(macosPath))
+                {
+                    Directory.CreateDirectory(macosPath);
+                }
 
+                var scriptPath = Path.Combine(macosPath, "SMAPI");
+                var scriptContent = $"#!/bin/bash\nexport SMAPI_USE_CURRENT_SHELL=true\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nexport TERM=xterm\ncd \"{smapiInfo.DirectoryName}\"\nWINEPREFIX=\"{Program.settings.WinePrefixPath}\" wine StardewModdingAPI.exe \"$@\"";
+                File.WriteAllText(scriptPath, scriptContent);
+                
+                var plistPath = Path.Combine(appPath, "Contents", "Info.plist");
+                var plistContent = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n<key>CFBundleExecutable</key>\n<string>SMAPI</string>\n<key>CFBundleIdentifier</key>\n<string>com.stardrop.smapi-wrapper</string>\n<key>CFBundleName</key>\n<string>SMAPI-Wine</string>\n<key>CFBundlePackageType</key>\n<string>APPL</string>\n<key>LSUIElement</key>\n<true/>\n</dict>\n</plist>";
+                File.WriteAllText(plistPath, plistContent);
+                
+                // Make the wrapper app executable
+                new Process { StartInfo = new ProcessStartInfo { FileName = "chmod", Arguments = $"+x \"{scriptPath}\"", CreateNoWindow = true } }.Start();
+
+                fileName = scriptPath;
+                arguments = $"--mods-path \"{Pathing.GetSelectedModsFolderPath()}\"";
+                parsedModPath = $"{Pathing.GetSelectedModsFolderPath()}";
                 /* Alternative route (using AppleScript) of activating Terminal + SMAPI
                 fileName = "/usr/bin/env";
                 arguments = $@"osascript -e ""tell application \""Terminal\""
@@ -161,14 +182,21 @@ namespace Stardrop.Utilities.External
 
         internal static SemVersion? GetVersion()
         {
-            AssemblyName smapiAssembly = AssemblyName.GetAssemblyName(Path.Combine(Pathing.defaultGamePath, "StardewModdingAPI.dll"));
+            try 
+            {
+                AssemblyName smapiAssembly = AssemblyName.GetAssemblyName(Pathing.GetSmapiPath());
 
-            if (smapiAssembly is null || smapiAssembly.Version is null)
+                if (smapiAssembly is null || smapiAssembly.Version is null)
+                {
+                    return null;
+                }
+
+                return SemVersion.Parse($"{smapiAssembly.Version.Major}.{smapiAssembly.Version.Minor}.{smapiAssembly.Version.Build}", SemVersionStyles.Any);
+            }
+            catch
             {
                 return null;
             }
-
-            return SemVersion.Parse($"{smapiAssembly.Version.Major}.{smapiAssembly.Version.Minor}.{smapiAssembly.Version.Build}", SemVersionStyles.Any);
         }
     }
 }

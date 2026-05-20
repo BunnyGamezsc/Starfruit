@@ -1,4 +1,4 @@
-﻿using Stardrop.Models.Data.Enums;
+using Stardrop.Models.Data.Enums;
 using Stardrop.Models.Nexus;
 using Stardrop.Models.SMAPI;
 
@@ -14,6 +14,7 @@ namespace Stardrop.Models
         public string SMAPIFolderPath { get; set; }
         public string ModFolderPath { get; set; }
         public string ModInstallPath { get; set; }
+        public string WinePrefixPath { get; set; }
         public bool IgnoreHiddenFolders { get; set; } = true;
         public bool EnableProfileSpecificModConfigs { get; set; }
         public bool ShouldWriteToModConfigs { get; set; }
