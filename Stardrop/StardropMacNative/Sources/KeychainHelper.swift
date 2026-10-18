@@ -2,7 +2,7 @@ import Foundation
 import Security
 
 struct KeychainHelper {
-    static let service = "com.starfruit.native"
+    static let service = "com.bunnygamez.starfruit"
     static let account = "nexus-api-key"
 
     private static func log(_ message: String) {
@@ -68,7 +68,7 @@ struct KeychainHelper {
         if status == errSecSuccess, let data = dataTypeRef as? Data {
             return String(data: data, encoding: .utf8)
         }
-        
+
         return nil
     }
 

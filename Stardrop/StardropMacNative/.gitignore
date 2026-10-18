@@ -1,1 +1,8 @@
 Starfruit.app
+.deps/
+.build/
+*.o
+*.dSYM/
+test_bin*
+Starfruit-universal.zip
+.DS_Store

@@ -1,13 +1,10 @@
 ﻿using Stardrop.Models.Nexus.Web;
-using Stardrop.ViewModels;
 using System;
-using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Timers;
 
 namespace Stardrop.Utilities
 {
@@ -84,8 +81,6 @@ namespace Stardrop.Utilities
                     if (recv.MessageType == WebSocketMessageType.Close) break;
 
                     var msg = Encoding.UTF8.GetString(buffer, 0, recv.Count);
-                    Program.helper.Log($"[Nexus SSO] Received data: {msg}", Helper.Status.Debug);
-
                     var response = JsonSerializer.Deserialize<WebsocketResponse>(msg);
                     if (response != null && response.Success && response.Data != null)
                     {

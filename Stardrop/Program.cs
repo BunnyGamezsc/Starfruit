@@ -1,4 +1,5 @@
-using Avalonia;
+﻿using Avalonia;
+using Avalonia.Controls;
 using Avalonia.ReactiveUI;
 using Avalonia.Shared.PlatformSupport;
 using CommandLine;
@@ -75,7 +76,6 @@ namespace Stardrop
             {
                 var operatingSystem = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows" : RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "Unix" : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macOS" : "Unknown";
                 helper.Log($"{Environment.NewLine}-- Startup Data --{Environment.NewLine}Time: {DateTime.Now}{Environment.NewLine}OS: [{operatingSystem}] {RuntimeInformation.OSDescription}{Environment.NewLine}Settings Directory: {Pathing.defaultHomePath}{Environment.NewLine}Active Directory: {Directory.GetCurrentDirectory()}{Environment.NewLine}Version: v{ApplicationVersion}{Environment.NewLine}----------------------{Environment.NewLine}");
-                helper.Log($"Started with the following arguments: {String.Join('|', args)}");
 
                 // Set the argument values
                 Parser.Default.ParseArguments<Options>(args).WithParsed<Options>(o =>
@@ -83,6 +83,12 @@ namespace Stardrop
                     onBootStartSMAPI = o.StartSmapi;
                     nxmLink = o.NXMLink;
                 });
+
+                // Log which application Windows will hand NXM links to
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    NXMProtocol.LogDiagnostics(executablePath);
+                }
 
                 // Verify the folder paths are created
                 Directory.CreateDirectory(Pathing.GetCacheFolderPath());
@@ -92,6 +98,8 @@ namespace Stardrop
                 Directory.CreateDirectory(Pathing.GetNexusPath());
                 Directory.CreateDirectory(Pathing.GetThumbnailsPath());
                 Directory.CreateDirectory(Pathing.GetSmapiUpgradeFolderPath());
+                Directory.CreateDirectory(Pathing.GetCollectionsCacheFolderPath());
+                Directory.CreateDirectory(Pathing.GetDefaultCollectionsFolderPath());
 
                 // Verify the settings folder path is created
                 if (File.Exists(Pathing.GetSettingsPath()))
@@ -125,6 +133,14 @@ namespace Stardrop
                     settings.ModInstallPath = Path.Combine(Pathing.defaultModPath, "Stardrop Installed Mods");
                 }
 
+                // Set the default collection install path (for mods that are installed by a collection). Unlike the
+                // mod install path this does not depend on where the mod folder points, as collections deliberately
+                // live outside it
+                if (String.IsNullOrEmpty(settings.CollectionInstallPath))
+                {
+                    settings.CollectionInstallPath = Pathing.GetDefaultCollectionsFolderPath();
+                }
+
                 // Set the default Nexus Mods information
                 if (settings.NexusDetails is null)
                 {
@@ -142,12 +158,14 @@ namespace Stardrop
                     dir.Delete(true);
                 }
 
-                // Load the translations
+                // Load the translations before selecting one, since the available languages are discovered from i18n.
+                translation.LoadTranslations();
                 if (String.IsNullOrEmpty(settings.Language))
                 {
                     settings.Language = translation.GetLanguageFromAbbreviation(CultureInfo.CurrentCulture.TwoLetterISOLanguageName);
                 }
-                translation.LoadTranslations(translation.GetLanguage(settings.Language));
+                settings.Language = translation.NormalizeLanguage(settings.Language);
+                translation.SetLanguage(settings.Language);
 
                 BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
             }
@@ -235,6 +253,12 @@ namespace Stardrop
         // Avalonia configuration, don't remove; also used by visual designer.
         public static AppBuilder BuildAvaloniaApp()
         {
+            // Below is required due to Avalonia UI design mode
+            if (Design.IsDesignMode)
+            {
+                Pathing.SetHomePath(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData));
+            }
+
             return AppBuilder.Configure<App>()
                 .UseReactiveUI()
                 .UsePlatformDetect()

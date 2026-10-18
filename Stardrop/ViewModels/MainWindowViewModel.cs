@@ -1,24 +1,27 @@
-using Avalonia.Collections;
+﻿using Avalonia.Collections;
 using Avalonia.Controls;
-using DynamicData;
 using Json.More;
 using ReactiveUI;
+using SharpCompress.Archives;
+using SharpCompress.Common;
 using Stardrop.Models;
 using Stardrop.Models.Data;
 using Stardrop.Models.Data.Enums;
 using Stardrop.Models.SMAPI;
 using Stardrop.Utilities;
+using Stardrop.Utilities.Extension;
 using Stardrop.Utilities.External;
 using Stardrop.Utilities.Internal;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 
 namespace Stardrop.ViewModels
 {
@@ -51,11 +54,22 @@ namespace Stardrop.ViewModels
         public DisplayFilter DisabledModFilter { get { return _disabledModFilter; } set { _disabledModFilter = value; UpdateFilter(); } }
 
         private bool _showUpdatableMods;
-        public bool ShowUpdatableMods { get { return _showUpdatableMods; } set { _showUpdatableMods = value; UpdateFilter(); } }
+        // Refreshes the counts as well as the grid, as this now widens the source scope both of them read
+        public bool ShowUpdatableMods { get { return _showUpdatableMods; } set { _showUpdatableMods = value; UpdateFilter(); RefreshModCounts(); } }
+        private ModSourceFilter _modSourceFilter = ModSourceFilter.ActiveProfile;
+        public ModSourceFilter ModSourceFilter { get { return _modSourceFilter; } set { _modSourceFilter = value; UpdateFilter(); RefreshModCounts(); } }
+        private bool _hasCollectionMods;
+        /// <summary>Whether any installed mod belongs to a collection. Drives the visibility of the source filter, which is noise for users with no collections</summary>
+        public bool HasCollectionMods { get { return _hasCollectionMods; } set { this.RaiseAndSetIfChanged(ref _hasCollectionMods, value); } }
+        private Profile? _activeProfile;
+        private HashSet<ModReference> _activeProfileReferences = new HashSet<ModReference>();
         private bool _showEndorsements;
         public bool ShowEndorsements { get { return _showEndorsements; } set { this.RaiseAndSetIfChanged(ref _showEndorsements, value); } }
         private bool _showInstalls;
         public bool ShowInstalls { get { return _showInstalls; } set { this.RaiseAndSetIfChanged(ref _showInstalls, value); } }
+        private bool _isNexusConnected;
+        /// <summary>Visibility preferences from the column context menu, keyed by ext:ColumnExtensions.Key</summary>
+        private Dictionary<string, bool> _columnPreferences = new Dictionary<string, bool>();
         private string _filterText;
         public string FilterText { get { return _filterText; } set { _filterText = value; UpdateFilter(); } }
         private List<string> _columnFilter;
@@ -66,6 +80,22 @@ namespace Stardrop.ViewModels
         public string DownloadsButtonText { get => _downloadsButtonText; set => this.RaiseAndSetIfChanged(ref _downloadsButtonText, value); }
         private int _modsWithCachedUpdates;
         public int ModsWithCachedUpdates { get { return _modsWithCachedUpdates; } set { this.RaiseAndSetIfChanged(ref _modsWithCachedUpdates, value); } }
+        private int _collectionsWithUpdates;
+        /// <summary>
+        /// Collections sitting behind a newer revision. Shown beside the mod update count as a pointer towards the
+        /// collections window, which is where the update itself is described and acted on.
+        /// </summary>
+        public int CollectionsWithUpdates
+        {
+            get { return _collectionsWithUpdates; }
+            set
+            {
+                this.RaiseAndSetIfChanged(ref _collectionsWithUpdates, value);
+                this.RaisePropertyChanged(nameof(HasCollectionUpdates));
+            }
+        }
+        /// <summary>Hides the collection update count outright, rather than showing a zero to the many users who have no collections</summary>
+        public bool HasCollectionUpdates { get { return _collectionsWithUpdates > 0; } }
         public string Version { get; set; }
 
         private string _nexusStatus = String.Concat("Nexus Mods: ", Program.translation.Get("internal.disconnected"));
@@ -116,26 +146,7 @@ namespace Stardrop.ViewModels
 
         public void OpenBrowser(string url)
         {
-            if (String.IsNullOrEmpty(url))
-            {
-                return;
-            }
-
-            try
-            {
-                using Process process = Process.Start(new ProcessStartInfo
-                {
-                    FileName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? url :
-                        RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "open" : "xdg-open",
-                    Arguments = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "" : $"\"{url}\"",
-                    CreateNoWindow = true,
-                    UseShellExecute = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                });
-            }
-            catch (Exception ex)
-            {
-                Program.helper.Log($"Failed to utilize OpenBrowser with the url ({url}): {ex}");
-            }
+            Toolkit.OpenBrowser(url);
         }
 
         public void ChangeColumnVisibility(MenuItem column)
@@ -163,6 +174,17 @@ namespace Stardrop.ViewModels
 
         public void SetColumnVisibility(MenuItem column, DataGrid modGrid, bool isActive)
         {
+            if (column.Header is not string header)
+            {
+                return;
+            }
+
+            var targetColumn = modGrid.Columns.FirstOrDefault(c => c.Header is string text && text == header);
+            if (targetColumn is null)
+            {
+                return;
+            }
+
             // Get the local data
             ClientData localDataCache = new ClientData();
             if (File.Exists(Pathing.GetDataCachePath()))
@@ -172,29 +194,101 @@ namespace Stardrop.ViewModels
 
             if (isActive)
             {
-                if (modGrid.Columns.Any(c => c.Header is TextBlock textBlock && textBlock.Text == (string)column.Header))
-                {
-                    column.Classes.Remove("ColumnInactive");
-                    column.Classes.Add("ColumnActive");
-
-                    modGrid.Columns.First(c => c.Header is TextBlock textBlock && textBlock.Text == (string)column.Header).IsVisible = true;
-                    localDataCache.ColumnActiveStates[(string)column.Header] = true;
-                }
+                column.Classes.Remove("ColumnInactive");
+                column.Classes.Add("ColumnActive");
             }
             else
             {
-                if (modGrid.Columns.Any(c => c.Header is TextBlock textBlock && textBlock.Text == (string)column.Header))
-                {
-                    column.Classes.Remove("ColumnActive");
-                    column.Classes.Add("ColumnInactive");
-
-                    modGrid.Columns.First(c => c.Header is TextBlock textBlock && textBlock.Text == (string)column.Header).IsVisible = false;
-                    localDataCache.ColumnActiveStates[(string)column.Header] = false;
-                }
+                column.Classes.Remove("ColumnActive");
+                column.Classes.Add("ColumnInactive");
             }
+
+            ApplyColumnVisibility(targetColumn, isActive);
+            localDataCache.ColumnActiveStates[header] = isActive;
 
             // Cache the local data
             File.WriteAllText(Pathing.GetDataCachePath(), JsonSerializer.Serialize(localDataCache, new JsonSerializerOptions() { WriteIndented = true }));
+        }
+
+        /// <summary>
+        /// Stores the user's choice for a column, then shows it only if its gate also allows it. Gated columns
+        /// stay hidden until the gate opens, at which point RefreshGatedColumns applies the stored choice.
+        /// </summary>
+        private void ApplyColumnVisibility(DataGridColumn targetColumn, bool isActive)
+        {
+            var columnKey = ColumnExtensions.GetKey(targetColumn);
+            if (String.IsNullOrEmpty(columnKey) is false)
+            {
+                _columnPreferences[columnKey] = isActive;
+            }
+
+            targetColumn.IsVisible = isActive && IsColumnGateOpen(targetColumn);
+        }
+
+        /// <summary>Whether anything outside the user's own preference is currently blocking a column</summary>
+        private bool IsColumnGateOpen(DataGridColumn targetColumn)
+        {
+            if (ColumnExtensions.GetRequiresNexus(targetColumn) is false)
+            {
+                return true;
+            }
+
+            return _isNexusConnected;
+        }
+
+        /// <summary>
+        /// Reapplies stored preferences for every column gated on Nexus, called when that connection is made or
+        /// lost. Columns with no stored preference default to visible, as the gate is what was hiding them.
+        /// </summary>
+        public void RefreshGatedColumns(DataGrid modGrid, bool isNexusConnected)
+        {
+            _isNexusConnected = isNexusConnected;
+
+            foreach (var targetColumn in modGrid.Columns)
+            {
+                if (ColumnExtensions.GetRequiresNexus(targetColumn) is false)
+                {
+                    continue;
+                }
+
+                var columnKey = ColumnExtensions.GetKey(targetColumn);
+                if (String.IsNullOrEmpty(columnKey))
+                {
+                    Program.helper.Log($"Failed to gate column {targetColumn.Header}: it lacks an ext:ColumnExtensions.Key value in the XAML.");
+                    continue;
+                }
+
+                bool isEnabled = _columnPreferences.TryGetValue(columnKey, out bool preference) ? preference : true;
+                targetColumn.IsVisible = isEnabled && isNexusConnected;
+            }
+        }
+
+        public void SetColumnOrder(DataGrid modGrid)
+        {
+            // Get the local data
+            ClientData localDataCache = new ClientData();
+            if (File.Exists(Pathing.GetDataCachePath()))
+            {
+                localDataCache = JsonSerializer.Deserialize<ClientData>(File.ReadAllText(Pathing.GetDataCachePath()), new JsonSerializerOptions { AllowTrailingCommas = true });
+            }
+
+            if (localDataCache is not null && modGrid is not null && modGrid.Columns is not null)
+            {
+                localDataCache.ColumnOrder.Clear();
+                foreach (var column in modGrid.Columns)
+                {
+                    var columnKey = ColumnExtensions.GetKey(column);
+                    if (string.IsNullOrEmpty(columnKey))
+                    {
+                        Program.helper.Log($"Failed to reorder column {column.Header.ToString()}: it lacks an ext:ColumnExtensions.Key value in the XAML.");
+                        continue;
+                    }
+                    localDataCache.ColumnOrder[columnKey] = column.DisplayIndex;
+                }
+
+                // Cache the local data
+                File.WriteAllText(Pathing.GetDataCachePath(), JsonSerializer.Serialize(localDataCache, new JsonSerializerOptions() { WriteIndented = true }));
+            }
         }
 
         public bool ParentFolderContainsPeriod(string oldestAncestorPath, DirectoryInfo? directoryInfo)
@@ -222,21 +316,154 @@ namespace Stardrop.ViewModels
             return false;
         }
 
-        public List<FileInfo> GetManifestFiles(DirectoryInfo modDirectory)
+        /// <summary>
+        /// Every installed collection's record, keyed by the source ID its mods carry. Read once per pass, as the
+        /// cache goes to disk on every call and every mod in a collection resolves to the same record.
+        /// </summary>
+        private static Dictionary<string, CollectionInstall> GetCollectionsBySourceId()
         {
-            List<FileInfo> manifests = new List<FileInfo>();
+            var collectionsBySourceId = new Dictionary<string, CollectionInstall>(StringComparer.OrdinalIgnoreCase);
+            foreach (var collection in CollectionCache.LoadAll())
+            {
+                collectionsBySourceId[collection.SourceId] = collection;
+            }
+
+            return collectionsBySourceId;
+        }
+
+        /// <summary>
+        /// Fills in what a collection mod shows about the collection it belongs to. Name can be empty on a record
+        /// built from a collection that never reported one, so the slug stands in for it, which is the same
+        /// fallback GetAvailableProfileName uses when naming the generated profile.
+        ///
+        /// A copy the record does not pin is one the user added into the collection's folder. Where the record
+        /// itself is missing nothing is marked, since a collection whose record has been lost pins nothing at all
+        /// and would otherwise report every mod it installed as an addition of the user's.
+        /// </summary>
+        private static void ApplyCollectionDetails(Mod mod, Dictionary<string, CollectionInstall> collectionsBySourceId)
+        {
+            if (String.IsNullOrEmpty(mod.SourceId))
+            {
+                return;
+            }
+
+            if (collectionsBySourceId.TryGetValue(mod.SourceId, out var collection) is false)
+            {
+                mod.CollectionName = mod.SourceId;
+                mod.IsCollectionAddOn = false;
+                return;
+            }
+
+            mod.CollectionName = String.IsNullOrEmpty(collection.Name) ? collection.Slug : collection.Name;
+            mod.IsCollectionAddOn = collection.IsModPinned(mod.UniqueId) is false;
+        }
+
+        /// <summary>
+        /// Reassigns what every collection mod shows from the cached records without a rescan. DiscoverMods reads
+        /// the records once per pass and an install rescans before its record is saved. Those passes can only
+        /// give the mods it installed the source ID fallback and would read them all as the user's add-ons.
+        /// </summary>
+        internal void RefreshCollectionDetails()
+        {
+            var collectionsBySourceId = GetCollectionsBySourceId();
+            foreach (var mod in Mods)
+            {
+                ApplyCollectionDetails(mod, collectionsBySourceId);
+            }
+        }
+
+        /// <summary>
+        /// The folders a discovery pass walks. Collections are installed outside the mod folder, so they are a root
+        /// of their own rather than something the mod folder walk reaches on its way down.
+        /// </summary>
+        private static List<string> GetScanRoots(string modsFilePath)
+        {
+            var roots = new List<string>();
+            if (String.IsNullOrEmpty(modsFilePath) is false && Directory.Exists(modsFilePath))
+            {
+                roots.Add(modsFilePath);
+            }
+
+            // Skipped when the mod folder already contains it, which would otherwise walk every collection twice
+            var collectionsPath = Pathing.GetCollectionsFolderPath();
+            if (Directory.Exists(collectionsPath) && roots.Any(r => Pathing.IsSameOrUnder(collectionsPath, r)) is false)
+            {
+                roots.Add(collectionsPath);
+            }
+
+            return roots;
+        }
+
+        /// <summary>
+        /// Walks every root, keeping each file paired with the root it was found under. The root has to travel with
+        /// the file because <see cref="ParentFolderContainsPeriod"/> measures from it, and the collections root sits
+        /// under the application data folder, which is itself a dotted folder on Linux and macOS. Measuring a
+        /// collection mod from the mod folder would find that period and hide every collection mod on those systems.
+        /// </summary>
+        private static List<(string Root, FileInfo File)> GetDiscoverableFiles(List<string> scanRoots, Func<DirectoryInfo, List<FileInfo>> walkRoot)
+        {
+            var found = new List<(string Root, FileInfo File)>();
+            foreach (var root in scanRoots)
+            {
+                foreach (var file in walkRoot(new DirectoryInfo(root)))
+                {
+                    found.Add((root, file));
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// The mod folder equivalent of <see cref="GetDiscoverableFiles"/>, carrying the root for the same reason.
+        /// </summary>
+        private List<(string Root, FileInfo Manifest, FileInfo? Config)> GetDiscoverableModFolders(List<string> scanRoots)
+        {
+            var found = new List<(string Root, FileInfo Manifest, FileInfo? Config)>();
+            foreach (var root in scanRoots)
+            {
+                foreach (var (manifest, config) in GetModFolders(new DirectoryInfo(root)))
+                {
+                    found.Add((root, manifest, config));
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// Finds every mod folder below the given directory, taking a folder that holds a manifest.json as a mod
+        /// and not descending past it. The config.json is picked out of the same enumeration that finds the
+        /// manifest, as walking for it separately reads every directory on disk a second time.
+        /// </summary>
+        public List<(FileInfo Manifest, FileInfo? Config)> GetModFolders(DirectoryInfo modDirectory)
+        {
+            List<(FileInfo Manifest, FileInfo? Config)> modFolders = new List<(FileInfo Manifest, FileInfo? Config)>();
             foreach (var directory in modDirectory.EnumerateDirectories())
             {
                 try
                 {
-                    var localManifest = directory.EnumerateFiles().FirstOrDefault(file => file.Name.Equals("manifest.json", StringComparison.OrdinalIgnoreCase));
+                    FileInfo? localManifest = null;
+                    FileInfo? localConfig = null;
+                    foreach (var file in directory.EnumerateFiles())
+                    {
+                        if (file.Name.Equals("manifest.json", StringComparison.OrdinalIgnoreCase))
+                        {
+                            localManifest = file;
+                        }
+                        else if (file.Name.Equals("config.json", StringComparison.OrdinalIgnoreCase))
+                        {
+                            localConfig = file;
+                        }
+                    }
+
                     if (localManifest is null)
                     {
-                        manifests.AddRange(GetManifestFiles(directory));
+                        modFolders.AddRange(GetModFolders(directory));
                     }
                     else
                     {
-                        manifests.Add(localManifest);
+                        modFolders.Add((localManifest, localConfig));
                     }
                 }
                 catch (Exception ex)
@@ -245,7 +472,148 @@ namespace Stardrop.ViewModels
                 }
             }
 
-            return manifests;
+            return modFolders;
+        }
+
+        public bool HasModInstalled(string uniqueID)
+        {
+            return Mods.Any(m => m.UniqueId.Equals(uniqueID, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Only use to install new mods that don't currently exist within manager. Use MainWindow.AddMods for the safer method (update handling, various safety checks, etc.)
+        /// </summary>
+        /// <param name="filePath"></param>
+        /// <returns></returns>
+        public async Task<List<Mod>> DirectModInstallAsync(string? fileFullName)
+        {
+            List<Mod> addedMods = new List<Mod>();
+            if (string.IsNullOrEmpty(fileFullName))
+            {
+                return addedMods;
+            }
+
+            try
+            {
+                // Extract the archive data
+                using (var archive = ArchiveFactory.OpenArchive(fileFullName))
+                {
+                    Dictionary<string, Manifest?> pathToManifests = new Dictionary<string, Manifest?>();
+                    foreach (var manifest in archive.Entries.Where(e => Path.GetFileName(e.Key)!.Equals("manifest.json", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        if (manifest.Key is not null)
+                        {
+                            Program.helper.Log(manifest.Key);
+
+                            // Skip any mods that already are installed (don't handle updates)
+                            var parsedManifest = await ManifestParser.GetDataAsync(manifest);
+                            if (parsedManifest is null || HasModInstalled(parsedManifest.UniqueID) is true)
+                            {
+                                continue;
+                            }
+                            pathToManifests[manifest.Key] = parsedManifest;
+                        }
+                    }
+
+                    // Warn and skip the install logic if the given archive has no manifest.json
+                    if (pathToManifests.Count == 0)
+                    {
+                        Program.helper.Log(String.Format(Program.translation.Get("ui.warning.no_manifest"), fileFullName));
+                        return addedMods;
+                    }
+
+                    int currentManifestIndex = 1;
+                    bool alwaysAskToDelete = Program.settings.AlwaysAskToDelete;
+                    foreach (var manifestPath in pathToManifests.Keys)
+                    {
+                        var manifest = pathToManifests[manifestPath];
+
+                        // If the archive doesn't have a manifest, warn the user
+                        if (manifest is not null)
+                        {
+                            var installPath = Program.settings.ModInstallPath;
+                            if (String.IsNullOrEmpty(manifestPath.Replace("manifest.json", String.Empty, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                installPath = Path.Combine(installPath, manifest.UniqueID);
+                            }
+
+                            // Create the base directory, if needed
+                            if (Directory.Exists(installPath) is false)
+                            {
+                                Directory.CreateDirectory(installPath);
+                            }
+
+                            Program.helper.Log($"Install path for mod {manifest.UniqueID}:{installPath}");
+                            var manifestFolderPath = manifestPath.Replace("manifest.json", String.Empty, StringComparison.OrdinalIgnoreCase);
+                            foreach (var entry in archive.Entries.Where(e => e.Key.StartsWith(manifestFolderPath)))
+                            {
+                                if (entry.Key.Contains("__MACOSX", StringComparison.OrdinalIgnoreCase) || entry.Key.Contains(".DS_Store", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    continue;
+                                }
+                                var outputPath = Path.Combine(installPath, manifestFolderPath, String.IsNullOrEmpty(manifestFolderPath) ? entry.Key : Path.GetRelativePath(manifestFolderPath, entry.Key));
+
+                                if (String.IsNullOrEmpty(manifestFolderPath) is false)
+                                {
+                                    var installDirectory = new DirectoryInfo(installPath);
+                                    var manifestDirectory = new DirectoryInfo(manifestFolderPath);
+                                    if (installDirectory.Exists && (installDirectory.Name.Equals(manifestDirectory.Name, StringComparison.OrdinalIgnoreCase) || installDirectory.Name.Equals(manifest.UniqueID)))
+                                    {
+                                        outputPath = Path.Combine(installPath, String.IsNullOrEmpty(manifestFolderPath) ? entry.Key : Path.GetRelativePath(manifestFolderPath, entry.Key));
+
+                                        Program.helper.Log(outputPath);
+                                    }
+                                }
+                                outputPath = Regex.Replace(outputPath, @"\s+\/", "/");
+
+                                // Entry keys are whatever the packer wrote, so they can hold characters this file
+                                // system rejects or a segment aiming above the install path. Rebuilding the path
+                                // below installPath keeps both out, at the cost of a folder named slightly differently
+                                var safeOutputPath = Pathing.GetSafeDestinationPath(installPath, Path.GetRelativePath(installPath, outputPath));
+                                if (String.IsNullOrEmpty(safeOutputPath))
+                                {
+                                    Program.helper.Log($"Skipping {entry.Key}, as it does not resolve to a path inside {installPath}", Utilities.Helper.Status.Warning);
+                                    continue;
+                                }
+                                outputPath = safeOutputPath;
+
+                                // Create the default location if it doesn't existe
+                                var outputFolder = Path.GetDirectoryName(outputPath);
+                                if (String.IsNullOrEmpty(outputFolder))
+                                {
+                                    continue;
+                                }
+                                else if (Directory.Exists(outputFolder) is false)
+                                {
+                                    Directory.CreateDirectory(outputFolder);
+                                }
+
+                                if (entry.IsDirectory is false)
+                                {
+                                    Program.helper.Log($"Writing mod file to {outputPath}");
+                                    await Task.Run(() => entry.WriteToFile(outputPath, new ExtractionOptions() { ExtractFullPath = false, Overwrite = true }));
+                                }
+                            }
+
+                            // Built the same way the entries above were, so that it points at the folder they created
+                            var modFolderPath = Pathing.GetSafeDestinationPath(installPath, manifestFolderPath) ?? installPath;
+                            addedMods.Add(new Mod(manifest, new FileInfo(modFolderPath), manifest.UniqueID, manifest.Version, manifest.Name, manifest.Description, manifest.Author));
+                        }
+                        else
+                        {
+                            Program.helper.Log(String.Format(Program.translation.Get("ui.warning.no_manifest"), fileFullName));
+                        }
+
+                        currentManifestIndex += 1;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.helper.Log($"Failed to unzip the file {fileFullName} due to the following error: {ex}", Utilities.Helper.Status.Warning);
+            }
+
+            return addedMods;
         }
 
         public void DiscoverMods(string modsFilePath)
@@ -256,7 +624,8 @@ namespace Stardrop.ViewModels
             }
             Mods.Clear();
 
-            if (modsFilePath is null || !Directory.Exists(modsFilePath))
+            var scanRoots = GetScanRoots(modsFilePath);
+            if (scanRoots.Count == 0)
             {
                 return;
             }
@@ -289,30 +658,84 @@ namespace Stardrop.ViewModels
                 }
             }
 
-            foreach (var fileInfo in GetManifestFiles(new DirectoryInfo(modsFilePath)))
+            // Read once for the whole pass rather than once per mod, as every mod in a collection resolves to the
+            // same record and CollectionCache.Load goes to disk each time it is called
+            var collectionsBySourceId = GetCollectionsBySourceId();
+
+            // Indexed once for the pass. The key cache holds thousands of entries and was previously scanned in
+            // full for every dependency of every mod
+            var modKeysByUniqueId = new Dictionary<string, ModKeyInfo>(StringComparer.OrdinalIgnoreCase);
+            if (modKeysCache is not null)
             {
-                if (fileInfo.DirectoryName is null || (Program.settings.IgnoreHiddenFolders && ParentFolderContainsPeriod(modsFilePath, fileInfo.Directory)))
+                foreach (var modKey in modKeysCache)
+                {
+                    if (modKey is null || String.IsNullOrEmpty(modKey.UniqueId))
+                    {
+                        continue;
+                    }
+
+                    modKeysByUniqueId.TryAdd(modKey.UniqueId, modKey);
+                }
+            }
+
+            // ModReference is a record whose Equals and GetHashCode already compare the (UniqueId, SourceId) pair
+            // case-insensitively, which is exactly what Matches does, so it serves as the key directly
+            var installDataByReference = new Dictionary<ModReference, ModInstallData>();
+            if (localDataCache is not null && localDataCache.ModInstallData is not null)
+            {
+                foreach (var installData in localDataCache.ModInstallData)
+                {
+                    if (installData is null || String.IsNullOrEmpty(installData.UniqueId))
+                    {
+                        continue;
+                    }
+
+                    installDataByReference.TryAdd(installData.ToReference(), installData);
+                }
+            }
+
+            // Where each reference landed in Mods, so a duplicate is found without scanning a collection that
+            // grows as the loop runs. Mods is cleared above and only appended to below
+            var modIndexByReference = new Dictionary<ModReference, int>();
+
+            ModKeyInfo? GetModKey(string? uniqueId)
+            {
+                if (String.IsNullOrEmpty(uniqueId))
+                {
+                    return null;
+                }
+
+                return modKeysByUniqueId.TryGetValue(uniqueId, out var modKey) ? modKey : null;
+            }
+
+            foreach (var (scanRoot, manifestInfo, configInfo) in GetDiscoverableModFolders(scanRoots))
+            {
+                if (manifestInfo.DirectoryName is null || (Program.settings.IgnoreHiddenFolders && ParentFolderContainsPeriod(scanRoot, manifestInfo.Directory)))
                 {
                     continue;
                 }
 
                 try
                 {
-                    var manifest = ManifestParser.GetData(File.ReadAllText(fileInfo.FullName));
+                    var manifest = ManifestParser.GetData(File.ReadAllText(manifestInfo.FullName));
                     if (manifest is null || String.IsNullOrEmpty(manifest.UniqueID))
                     {
-                        Program.helper.Log($"The manifest.json was empty or not deserializable from {fileInfo.DirectoryName}", Helper.Status.Alert);
+                        Program.helper.Log($"The manifest.json was empty or not deserializable from {manifestInfo.DirectoryName}", Helper.Status.Alert);
                         continue;
                     }
 
-                    var mod = new Mod(manifest, fileInfo, manifest.UniqueID, manifest.Version, manifest.Name, manifest.Description, manifest.Author);
-                    if (manifest.ContentPackFor is not null && modKeysCache is not null)
+                    var mod = new Mod(manifest, manifestInfo, manifest.UniqueID, manifest.Version, manifest.Name, manifest.Description, manifest.Author);
+                    ApplyCollectionDetails(mod, collectionsBySourceId);
+
+                    // Identity is (SourceId, UniqueId), so a collection's pinned copy never displaces a loose install of the same mod
+                    var modReference = mod.ToReference();
+                    if (manifest.ContentPackFor is not null)
                     {
-                        var dependencyKey = modKeysCache.FirstOrDefault(m => m.UniqueId.Equals(manifest.ContentPackFor.UniqueID, StringComparison.OrdinalIgnoreCase));
+                        var dependencyKey = GetModKey(manifest.ContentPackFor.UniqueID);
                         mod.FrameworkID = manifest.ContentPackFor.UniqueID;
                         mod.Requirements.Add(new ManifestDependency(manifest.ContentPackFor.UniqueID, manifest.ContentPackFor.MinimumVersion, true) { Name = dependencyKey is null ? manifest.ContentPackFor.UniqueID : dependencyKey.Name });
                     }
-                    if (manifest.Dependencies is not null && modKeysCache is not null)
+                    if (manifest.Dependencies is not null)
                     {
                         foreach (var dependency in manifest.Dependencies)
                         {
@@ -321,43 +744,52 @@ namespace Stardrop.ViewModels
                                 continue;
                             }
 
-                            var dependencyKey = modKeysCache.FirstOrDefault(m => m.UniqueId.Equals(dependency.UniqueID, StringComparison.OrdinalIgnoreCase));
+                            var dependencyKey = GetModKey(dependency.UniqueID);
                             mod.Requirements.Add(new ManifestDependency(dependency.UniqueID, dependency.MinimumVersion, dependency.IsRequired) { Name = dependencyKey is null ? dependency.UniqueID : dependencyKey.Name });
                         }
                     }
-                    if (modKeysCache is not null && modKeysCache.Any(m => m.UniqueId.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)))
+
+                    var modKey = GetModKey(mod.UniqueId);
+                    if (modKey is not null)
                     {
-                        mod.ModPageUri = modKeysCache.First(m => m.UniqueId.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)).PageUrl;
+                        mod.ModPageUri = modKey.PageUrl;
                     }
 
-                    if (localDataCache is not null && localDataCache.ModInstallData is not null && localDataCache.ModInstallData.Any(m => m.UniqueId.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)))
+                    // Matched on the copy rather than the unique ID, so a collection's pinned mod and the user's own
+                    // install of it keep their own dates. A record written before SourceId existed carries none, so
+                    // it matches the loose copy and a collection copy simply starts fresh
+                    if (installDataByReference.TryGetValue(modReference, out var installData))
                     {
-                        mod.InstallTimestamp = localDataCache.ModInstallData.First(m => m.UniqueId.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)).InstallTimestamp;
-                        mod.LastUpdateTimestamp = localDataCache.ModInstallData.First(m => m.UniqueId.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)).LastUpdateTimestamp;
+                        mod.InstallTimestamp = installData.InstallTimestamp;
+                        mod.LastUpdateTimestamp = installData.LastUpdateTimestamp;
                     }
 
-                    // Check if any config file exists
-                    var configPath = Path.Combine(fileInfo.DirectoryName, "config.json");
-                    if (File.Exists(configPath) && new FileInfo(configPath) is FileInfo configInfo && configInfo is not null)
+                    if (localDataCache is not null && localDataCache.IgnoredUpdates is not null && localDataCache.IgnoredUpdates.TryGetValue(mod.UniqueId, out string? value))
+                    {
+                        mod.IgnoredVersion = value;
+                    }
+
+                    // Taken from the walk that found the manifest, rather than a second pass over the tree
+                    if (configInfo is not null)
                     {
                         mod.Config = new Config() { UniqueId = mod.UniqueId, FilePath = configInfo.FullName, LastWriteTimeUtc = configInfo.LastWriteTimeUtc, Data = File.ReadAllText(configInfo.FullName) };
                     }
 
                     // Add or update the mod
-                    if (!Mods.Any(m => m.UniqueId.Equals(manifest.UniqueID, StringComparison.OrdinalIgnoreCase)))
+                    if (modIndexByReference.TryGetValue(modReference, out var existingIndex) is false)
                     {
+                        modIndexByReference[modReference] = Mods.Count;
                         Mods.Add(mod);
                     }
-                    else if (Mods.FirstOrDefault(m => m.UniqueId.Equals(manifest.UniqueID, StringComparison.OrdinalIgnoreCase) && m.Version.CompareSortOrderTo(mod.Version) < 0) is Mod oldMod && oldMod is not null)
+                    else if (Mods[existingIndex].Version.CompareSortOrderTo(mod.Version) < 0)
                     {
                         // Replace old mod with newer one
-                        int oldModIndex = Mods.IndexOf(Mods.First(m => m.UniqueId.Equals(manifest.UniqueID, StringComparison.OrdinalIgnoreCase) && m.Version.CompareSortOrderTo(mod.Version) < 0));
-                        Mods[oldModIndex] = mod;
+                        Mods[existingIndex] = mod;
                     }
                 }
                 catch (Exception ex)
                 {
-                    Program.helper.Log($"Unable to load the manifest.json from {fileInfo.DirectoryName}: {ex}", Helper.Status.Alert);
+                    Program.helper.Log($"Unable to load the manifest.json from {manifestInfo.DirectoryName}: {ex}", Helper.Status.Alert);
                 }
             }
 
@@ -375,7 +807,7 @@ namespace Stardrop.ViewModels
                     mod.InstallTimestamp = DateTime.Now;
                 }
 
-                modInstallData.Add(new ModInstallData() { UniqueId = mod.UniqueId, InstallTimestamp = mod.InstallTimestamp.Value, LastUpdateTimestamp = mod.LastUpdateTimestamp });
+                modInstallData.Add(new ModInstallData() { UniqueId = mod.UniqueId, SourceId = mod.SourceId, InstallTimestamp = mod.InstallTimestamp.Value, LastUpdateTimestamp = mod.LastUpdateTimestamp });
             }
             localDataCache.ModInstallData = modInstallData;
 
@@ -383,10 +815,11 @@ namespace Stardrop.ViewModels
             File.WriteAllText(Pathing.GetDataCachePath(), JsonSerializer.Serialize(localDataCache, new JsonSerializerOptions() { WriteIndented = true }));
 
             EvaluateRequirements();
-            DiscoverConfigs(modsFilePath, useArchive: true);
+
             HideRequiredMods();
 
-            ActualModCount = Mods.Count(m => !m.IsHidden);
+            HasCollectionMods = Mods.Any(m => m.IsFromCollection);
+            RefreshModCounts();
         }
 
         public void HideRequiredMods()
@@ -398,11 +831,72 @@ namespace Stardrop.ViewModels
                 mod.IsEnabled = true;
             }
 
-            // Update the EnabledModCount
-            EnabledModCount = Mods.Where(m => m.IsEnabled && !m.IsHidden).Count();
+            RefreshModCounts();
 
             // Update data grid grouping
             UpdateDataGridGrouping();
+        }
+
+        /// <summary>
+        /// Finds the copy of a dependency that will actually be loaded alongside the given mod. With collections in
+        /// play the same unique ID can exist several times, so a copy that is already enabled is taken before any
+        /// other, and a mod's dependency otherwise resolves within its own source first. Falling back to any copy
+        /// would mark a requirement satisfied by a mod that is not enabled.
+        /// </summary>
+        internal Mod? ResolveRequirement(Mod dependent, string requirementUniqueId)
+        {
+            var candidates = Mods.Where(m => m.UniqueId.Equals(requirementUniqueId, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            // An enabled copy wins over everything else, the dependent's own source first. Each enabled mod is
+            // handed to SMAPI as a junction of its own, so resolving past one that is already on and enabling a
+            // second copy puts two folders claiming the same unique ID in the mods folder
+            var enabledMatch = candidates.FirstOrDefault(m => m.IsEnabled && String.Equals(m.SourceId, dependent.SourceId, StringComparison.OrdinalIgnoreCase));
+            if (enabledMatch is null)
+            {
+                enabledMatch = candidates.FirstOrDefault(m => m.IsEnabled);
+            }
+
+            if (enabledMatch is not null)
+            {
+                return enabledMatch;
+            }
+
+            // Nothing is on yet, so the copy that belongs alongside the dependent is the one to reach for
+            var sameSourceMatch = candidates.FirstOrDefault(m => String.Equals(m.SourceId, dependent.SourceId, StringComparison.OrdinalIgnoreCase));
+            if (sameSourceMatch is not null)
+            {
+                return sameSourceMatch;
+            }
+
+            // A collection mod can legitimately depend on something the user already had loose, so a loose install
+            // is a valid fallback even while off. The reverse only holds through the enabled check above, as a
+            // loose mod has no claim on a collection's copy unless that copy is already going to load
+            if (dependent.IsFromCollection)
+            {
+                return candidates.FirstOrDefault(m => m.IsFromCollection is false);
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The mods that would actually load the given mod as a requirement. The mirror of
+        /// <see cref="ResolveRequirement"/>: a mod naming this unique ID only counts as a dependent when this is
+        /// the copy its own source resolves to, so acting on a collection's copy leaves an identically named loose
+        /// copy and everything depending on that one alone.
+        /// </summary>
+        internal List<Mod> GetDependents(Mod mod)
+        {
+            var dependents = new List<Mod>();
+            foreach (var candidate in Mods.Where(m => m.Requirements.Any(r => r.IsRequired && r.UniqueID.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase))))
+            {
+                if (ReferenceEquals(ResolveRequirement(candidate, mod.UniqueId), mod))
+                {
+                    dependents.Add(candidate);
+                }
+            }
+
+            return dependents;
         }
 
         public void EvaluateRequirements()
@@ -421,7 +915,8 @@ namespace Stardrop.ViewModels
                 {
                     foreach (var requirement in mod.Requirements.Where(r => r.IsRequired))
                     {
-                        if (!Mods.Any(m => m.UniqueId.Equals(requirement.UniqueID, StringComparison.OrdinalIgnoreCase)) || Mods.First(m => m.UniqueId.Equals(requirement.UniqueID, StringComparison.OrdinalIgnoreCase)) is Mod matchedMod && matchedMod.IsModOutdated(requirement.MinimumVersion))
+                        var matchedMod = ResolveRequirement(mod, requirement.UniqueID);
+                        if (matchedMod is null || matchedMod.IsModOutdated(requirement.MinimumVersion))
                         {
                             requirement.IsMissing = true;
 
@@ -430,6 +925,12 @@ namespace Stardrop.ViewModels
                                 var dependencyKey = modKeysCache.FirstOrDefault(m => m.UniqueId.Equals(requirement.UniqueID, StringComparison.OrdinalIgnoreCase));
                                 requirement.Name = dependencyKey is null ? requirement.UniqueID : dependencyKey.Name;
                             }
+                        }
+                        else
+                        {
+                            // Clear the flag, otherwise a requirement stays missing after it has been satisfied on
+                            // any pass that does not rebuild the mod list first
+                            requirement.IsMissing = false;
                         }
                     }
 
@@ -467,20 +968,25 @@ namespace Stardrop.ViewModels
 
         public void DiscoverConfigs(string modsFilePath, bool useArchive = false)
         {
-            if (modsFilePath is null || !Directory.Exists(modsFilePath))
+            var modsByDirectory = new Dictionary<string, Mod>(StringComparer.Ordinal);
+            foreach (var knownMod in Mods)
             {
-                return;
-            }
-
-            foreach (var fileInfo in GetConfigFiles(new DirectoryInfo(modsFilePath)))
-            {
-                if (fileInfo.DirectoryName is null || (Program.settings.IgnoreHiddenFolders && ParentFolderContainsPeriod(modsFilePath, fileInfo.Directory)))
+                if (knownMod.ModFileInfo is null || knownMod.ModFileInfo.DirectoryName is null)
                 {
                     continue;
                 }
 
-                var mod = Mods.FirstOrDefault(m => m.ModFileInfo is not null && m.ModFileInfo.DirectoryName == fileInfo.DirectoryName);
-                if (mod is null)
+                modsByDirectory.TryAdd(knownMod.ModFileInfo.DirectoryName, knownMod);
+            }
+
+            foreach (var (scanRoot, fileInfo) in GetDiscoverableFiles(GetScanRoots(modsFilePath), GetConfigFiles))
+            {
+                if (fileInfo.DirectoryName is null || (Program.settings.IgnoreHiddenFolders && ParentFolderContainsPeriod(scanRoot, fileInfo.Directory)))
+                {
+                    continue;
+                }
+
+                if (modsByDirectory.TryGetValue(fileInfo.DirectoryName, out var mod) is false)
                 {
                     continue;
                 }
@@ -505,10 +1011,20 @@ namespace Stardrop.ViewModels
         {
             // Merge any existing preserved configs
             List<Config> pendingConfigUpdates = new List<Config>();
-            foreach (var modId in profile.EnabledModIds.Select(id => id.ToLower()))
+            foreach (var reference in profile.EnabledModIds)
             {
-                var mod = Mods.FirstOrDefault(m => m.UniqueId.Equals(modId, StringComparison.OrdinalIgnoreCase));
+                var modId = reference.UniqueId.ToLower();
+                var mod = Mods.FirstOrDefault(m => reference.Matches(m));
                 if (mod is null || mod.ModFileInfo is null)
+                {
+                    continue;
+                }
+
+                // A collection owns the configuration of the mods it installs, the same way it owns their versions.
+                // Its curator ships configuration as part of the curated result, and preserving a snapshot of that
+                // would merge it back over whatever they publish next. The file in the collection's folder is the
+                // configuration, with nothing shadowing it
+                if (mod.IsFromCollection)
                 {
                     continue;
                 }
@@ -605,6 +1121,30 @@ namespace Stardrop.ViewModels
             }
         }
 
+        /// <summary>
+        /// Whether the profile enables mods whose configuration belongs to a collection. Lets an empty save be told
+        /// apart from one that found no configuration at all, since these mods are visibly carrying configuration in
+        /// the grid and their absence from a save needs explaining.
+        /// </summary>
+        internal bool HasCollectionOwnedConfigs(Profile profile)
+        {
+            foreach (var reference in profile.EnabledModIds)
+            {
+                var mod = Mods.FirstOrDefault(m => reference.Matches(m));
+                if (mod is null || mod.IsFromCollection is false)
+                {
+                    continue;
+                }
+
+                if (mod.HasConfig)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         internal void ReadModConfigs(Profile profile)
         {
             ReadModConfigs(profile, GetPendingConfigUpdates(profile));
@@ -662,18 +1202,82 @@ namespace Stardrop.ViewModels
 
         public void EnableModsByProfile(Profile profile)
         {
+            // Cached so the source filter does not walk the reference list once per grid row
+            _activeProfile = profile;
+            _activeProfileReferences = new HashSet<ModReference>(profile.EnabledModIds);
+
             foreach (var mod in Mods)
             {
                 mod.IsEnabled = false;
-                if (profile.EnabledModIds.Any(id => id.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)))
+                if (profile.EnabledModIds.Any(reference => reference.Matches(mod)))
                 {
                     mod.IsEnabled = true;
+                }
+
+                // Set any mod notes
+                mod.Note = string.Empty;
+                if (profile.Notes.FirstOrDefault(data => data.UniqueId.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)) is var noteData && noteData is not null)
+                {
+                    mod.Note = noteData.Note;
                 }
             }
             HideRequiredMods();
 
-            // Update the EnabledModCount
-            EnabledModCount = Mods.Where(m => m.IsEnabled && !m.IsHidden).Count();
+            RefreshModCounts();
+            UpdateFilter();
+        }
+
+        /// <summary>
+        /// Whether the source scoping is set aside for the moment. Asking to see updatable mods is a request for the
+        /// mods that have updates, wherever they live. Left in place, a collection profile answers it with an empty
+        /// grid while the count beside the button reports several waiting, as collection mods never carry update
+        /// data and the profile shows nothing else.
+        /// </summary>
+        private bool IsSourceFilterOverridden()
+        {
+            return _showUpdatableMods;
+        }
+
+        /// <summary>
+        /// Whether a mod belongs to what the user is currently looking at. A collection profile shows everything the
+        /// collection installed, plus anything it reuses from outside its own folder, while a plain profile shows
+        /// everything no collection owns.
+        /// </summary>
+        private bool PassesSourceFilter(Mod mod)
+        {
+            if (_modSourceFilter is ModSourceFilter.All || IsSourceFilterOverridden())
+            {
+                return true;
+            }
+
+            if (_activeProfile is not null && _activeProfile.IsFromCollection)
+            {
+                // A mod this collection installed belongs on screen whether or not it is currently enabled, as the
+                // collection is what defines the profile's contents. Answered from SourceId, which comes off the
+                // folder path and so outlives the profile being saved without the mod in it. Reading membership from
+                // the references alone made disabling a mod remove it from the view at the next profile pass
+                if (String.Equals(mod.SourceId, _activeProfile.SourceId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                // Anything else is on screen because the profile reaches outside the collection for it, which is not
+                // recorded anywhere but the references
+                return _activeProfileReferences.Contains(mod.ToReference());
+            }
+
+            return mod.IsFromCollection is false;
+        }
+
+        /// <summary>
+        /// Recalculates the footer counts. These follow the source filter, otherwise the totals disagree with what
+        /// the grid is showing. That includes the override above, so turning on Show Updatable Mods widens the
+        /// counts alongside the grid rather than leaving them describing a scope the grid has stepped out of.
+        /// </summary>
+        public void RefreshModCounts()
+        {
+            EnabledModCount = Mods.Count(m => m.IsEnabled && m.IsHidden is false && PassesSourceFilter(m));
+            ActualModCount = Mods.Count(m => m.IsHidden is false && PassesSourceFilter(m));
         }
 
         public void ForceModState(Profile profile, List<Mod> mods, bool modEnableState = false)
@@ -687,8 +1291,62 @@ namespace Stardrop.ViewModels
                 mod.IsEnabled = modEnableState;
             }
 
-            // Update the EnabledModCount
-            EnabledModCount = Mods.Where(m => m.IsEnabled && !m.IsHidden).Count();
+            // Matched on the unique ID alone, so a mod a collection and the mod folder both provide has just had
+            // every copy turned on
+            if (modEnableState)
+            {
+                ResolveEnabledDuplicates();
+            }
+
+            RefreshModCounts();
+        }
+
+        /// <summary>
+        /// Turns off every other enabled copy of the given mods' unique IDs. Each enabled mod is handed to SMAPI as
+        /// a junction of its own, so two folders claiming one unique ID is an error rather than a preference, and
+        /// the copy the user acted on is the one that stands.
+        /// </summary>
+        internal void DisableDuplicatesOf(IEnumerable<Mod> mods)
+        {
+            foreach (var mod in mods.Where(m => m.IsEnabled).ToList())
+            {
+                foreach (var duplicate in Mods.Where(m => m.IsEnabled && ReferenceEquals(m, mod) is false && m.UniqueId.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)).ToList())
+                {
+                    Program.helper.Log($"Disabling {duplicate.Name} ({duplicate.SourceId ?? "local"}), as another copy of {duplicate.UniqueId} has been enabled");
+                    duplicate.IsEnabled = false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Collapses every unique ID down to one enabled copy. Used by the paths that turn mods on in bulk, where
+        /// there is no single mod the user acted on to keep, so the copy belonging to the active profile wins,
+        /// then a loose install, then whichever was found first.
+        /// </summary>
+        internal void ResolveEnabledDuplicates()
+        {
+            var preferredSourceId = _activeProfile is not null && _activeProfile.IsFromCollection ? _activeProfile.SourceId : null;
+            foreach (var group in Mods.Where(m => m.IsEnabled).GroupBy(m => m.UniqueId, StringComparer.OrdinalIgnoreCase).ToList())
+            {
+                var copies = group.ToList();
+                if (copies.Count < 2)
+                {
+                    continue;
+                }
+
+                var keptCopy = copies.FirstOrDefault(m => String.Equals(m.SourceId, preferredSourceId, StringComparison.OrdinalIgnoreCase));
+                if (keptCopy is null)
+                {
+                    keptCopy = copies.FirstOrDefault(m => m.IsFromCollection is false);
+                }
+
+                if (keptCopy is null)
+                {
+                    keptCopy = copies.First();
+                }
+
+                DisableDuplicatesOf(new List<Mod> { keptCopy });
+            }
         }
 
         internal void UpdateDataGridGrouping()
@@ -728,14 +1386,47 @@ namespace Stardrop.ViewModels
             }
         }
 
+        /// <summary>
+        /// The mods the grid is showing. Bulk actions run through this so that what the user is looking at is what
+        /// they act on, which takes in the source filter, the search box, the enabled and disabled filters and the
+        /// hidden mods under one rule. Evaluated against the current state rather than read back off DataView, so a
+        /// mod toggled since the last filter pass is judged on where it stands now.
+        /// </summary>
+        public List<Mod> GetVisibleMods()
+        {
+            return Mods.Where(m => ModFilter(m)).ToList();
+        }
+
         internal void UpdateFilter()
         {
             if (DataView is not null)
             {
+                TrackEnabledModsForSourceFilter();
                 UpdateDataGridGrouping();
 
                 DataView.Filter = null;
                 DataView.Filter = ModFilter;
+            }
+        }
+
+        /// <summary>
+        /// Folds whatever is currently enabled into the set the source filter shows. Done here rather than at each
+        /// place a mod is toggled, as this runs immediately before the filter is applied and so catches every path
+        /// that could have changed the enabled state. The set only grows within a session and is rebuilt from the
+        /// profile whenever one is applied, which is what keeps a mod the profile reached outside the collection for
+        /// on screen after the user disables it. A mod the collection installed no longer relies on this, as
+        /// <see cref="PassesSourceFilter"/> answers for those from SourceId.
+        /// </summary>
+        private void TrackEnabledModsForSourceFilter()
+        {
+            if (_activeProfile is null || _activeProfile.IsFromCollection is false)
+            {
+                return;
+            }
+
+            foreach (var mod in Mods.Where(m => m.IsEnabled))
+            {
+                _activeProfileReferences.Add(mod.ToReference());
             }
         }
 
@@ -748,6 +1439,11 @@ namespace Stardrop.ViewModels
             }
 
             if (mod.IsHidden)
+            {
+                return false;
+            }
+
+            if (PassesSourceFilter(mod) is false)
             {
                 return false;
             }
@@ -765,7 +1461,7 @@ namespace Stardrop.ViewModels
                 return false;
             }
 
-            if (_showUpdatableMods && String.IsNullOrEmpty(mod.ParsedStatus))
+            if (_showUpdatableMods && mod.HasActionableStatus is false)
             {
                 return false;
             }

@@ -1,4 +1,4 @@
-using Stardrop.Models.Data.Enums;
+﻿using Stardrop.Models.Data.Enums;
 using Stardrop.Models.Nexus;
 using Stardrop.Models.SMAPI;
 
@@ -15,6 +15,14 @@ namespace Stardrop.Models
         public string ModFolderPath { get; set; }
         public string ModInstallPath { get; set; }
         public string WinePrefixPath { get; set; }
+        /// <summary>
+        /// Where a collection installs the mods it pins. Kept outside the mod folder, as a collection installs its
+        /// own copy of every mod and SMAPI skips every copy of a duplicated unique ID rather than picking one. An
+        /// empty value falls back to <see cref="Utilities.Pathing.GetDefaultCollectionsFolderPath"/>. Only the mods
+        /// follow this: the collection records stay alongside the profiles under the data folder, as they are small
+        /// and are keyed by source ID rather than by path.
+        /// </summary>
+        public string CollectionInstallPath { get; set; }
         public bool IgnoreHiddenFolders { get; set; } = true;
         public bool EnableProfileSpecificModConfigs { get; set; }
         public bool ShouldWriteToModConfigs { get; set; }
@@ -27,6 +35,19 @@ namespace Stardrop.Models
         public bool ShowModThumbnails { get; set; }
         public NexusServers PreferredNexusServer { get; set; } = NexusServers.NexusCDN;
         public bool IsAskingBeforeAcceptingNXM { get; set; } = true;
+        /// <summary>
+        /// Whether adding a mod while a collection profile is active asks where it should go. When this is off the
+        /// mod is installed into that collection's folder without asking.
+        /// </summary>
+        public bool AlwaysAskForCollectionInstallTarget { get; set; } = true;
+        /// <summary>Whether a collection entry's link asks Nexus Mods for the mod manager download rather than the plain file page</summary>
+        public bool UseNXMLinks { get; set; } = true;
+        /// <summary>
+        /// Whether SMAPI is told to leave a collection's mods out of its own update checks. Stardrop already keeps
+        /// them out of its, since the collection owns their versions, and without this SMAPI's console reports
+        /// updates the user is not meant to act on.
+        /// </summary>
+        public bool CollectionsSkipSMAPIUpdateCheck { get; set; } = true;
         public GameDetails GameDetails { get; set; }
         public NexusUser NexusDetails { get; set; }
 
