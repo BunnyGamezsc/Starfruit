@@ -1,0 +1,194 @@
+3d0d67d Update GitHub Actions for macOS ARM64 packaging
+63de9ae Remove platform target settings from project file
+5b8b5d1 Update artifact name for macOS package workflow
+b404778 Rename artifact names for macOS ARM64 and x64
+fc1d09a Add Stardrop-osx-arm64.zip to release files
+f6ea6a5 Merge branch 'development' into development
+cc66264 update SharpCompress to secure version
+e8069ae Update zh.json
+0b4d62d Merge branch 'development' into development
+8518dae Add ARM64 support for Linux and Windows packaging
+b233462 Update package-and-release.yml
+0b81a9a Update artifact name for Windows package workflow
+9c1e5d0 Update artifact names for Linux and Windows packages
+4cf83dd Update zip commands for arm64 architecture
+3c46021 Working profile exporting
+153615a Working profile importing
+86ef91a Fixed previewer tool not loading while in design mode for Avalonia UI
+4b96057 Moved PortableModData record to Mod via GetPortableData
+58cfd41 Moved OpenBrowser to Toolkit
+3def11d Implemented Toolkit.IsFromSite
+7950f28 Implemented BaseWindow
+accad7c Moved HasModInstalled to MainWindowViewModel
+8c12843 Fixed FlexibleOptionWindow buttons not centering
+3f71080 Added design mode only settings for FlexibleOptionWindow
+35831e5 Implemented MainWindowViewModel.DirectModInstallAsync
+14f5df4 Implemented MissingModsWindow to display mods missing during profile import
+5166446 Implemented ProfileExportWindow
+3999bdd Implemented Mod.Note
+295cedb Increased missing mod display count to 5
+e9dffda Added missing i18n lines
+db3e3b4 Code cleanup
+a2840ee Merge branch 'development' into development
+21cea22 Merge pull request #342 from CuteCat233/development
+240fdd9 v1.9.0-beta.2 released
+c6548bc Merge branch 'Floogen:development' into sharpcompress-fix
+9b10bd6 Fix missing sharpcompress call
+94a45e5 Now showing "Save Profile Changes" button when updating notes if Settings.ShouldAutomaticallySaveProfileChanges is false
+a093055 Moved all DataGridTemplateColumn.Header to Header property
+2bd8e3b Implemented column reordering
+0f9a507 Merge branch 'development' into sharpcompress-fix
+c5227f9 Applied adjustments to new DirectModInstallAsync method
+b8cc524 Merge pull request #343 from SZanko/sharpcompress-fix
+5d3c5bb Updated download badges for ARM based releases
+3122f5c Merge branch 'development' into development
+da228c0 Merge pull request #325 from Sprospring/development
+a785f3f v1.9.0-beta.3 released
+62e6bf5 Adjusted Stardrop update logic to check for ARM architecture
+47c1407 v1.9.0 released
+95be00d Update version-build.yml
+1ac8460 Update nexus-mods-upload.yml
+4902fbd Updated it.json
+0aa2718 Update zh.json
+f05b075 Ignore Update Feature
+ab79215 Add changelog viewer for Nexus Mods updates
+152a2e1 Add Dutch translation
+686f69b Update Info.plist
+00bda2b Rough start to Nexus collections based on #305
+2a80a05 Modified AddMods to link those added via collections
+63d5a72 Now reusing existing mods if the collection requires them, instead of duplicating
+41d24ee Renamed partial collection classes
+97fc6b3 Added profile specific filtering to handle duplicate mod entries across collections
+c12ba8c Fixed int as string parsing for GraphQL calls
+6c0e722 Fixed collections not showing their respective profile until restart
+fd0876d Adjusted warning window to allow for custom widths
+3251160 Now showing collection download progress
+424a4d7 Allow collection deletion via profiles
+689b066 Adjusted FlexibleOptionWindow to support width resizing
+d0ae431 Removed height restriction for WarningWindow
+2dae174 Reverted warning window alignment changes
+bb2cce5 Adjusted collection canceling to skip the install of downloaded mods
+3727a40 Added hyperlink support to WarningWindow
+d9e818b Updated collection display to utilize hyperlinks
+cafb7c8 Added modRules handling for collections
+802b0a1 Fixed bundled mods not copying over
+a120e49 Fixed fileId not being used to grab specific mod files
+e353035 Now setting profile to collection automatically after initial download
+ffa1464 Reverted to download everything from a collection instead of reusing
+ce15498 Moved collections to Stardrop's data path
+8297f0d Initial collection overview window
+4d49b3d Added sorting and other changes to collection window
+14d8077 Fixed profile copy button not respecting protected status
+82ce9be Moved collection management to its respective window from profiles
+37414ad Added button specific brushes and handling
+09331b1 Added NXM support for collection manual downloads
+988e6d6 Added drag and drop support for collection mod files
+6caa6a6 Reverted hardcoded Program.settings.NexusDetails.IsPremium = false
+3bedfef Added "Open Missing" button for collection window
+aab0c71 Added better NXM / drag-and-drop handling for collection mods
+1faa51f Fixed spacing at end of path segments resulting in failed collection installs
+e34dee2 Fixed hyperlink text style in warning window
+4f81169 Added collection install stage details
+15b8520 Fixed collection summary not updating on collection install
+ac43aeb Now hiding "Open Missing" button on collections page if not needed
+70a1709 Fixed optional mods not being handled correctly
+b15df92 Updated profiles to better show if they are from a collection
+1388fdd Added some visual clarity for mods sourced from collections
+1cb118f Implemented various fixes for mod grid when dealing with duplicated / shared mods
+6424d61 Fixed duplicate mods being enabled across collections or local
+fd9cdcd Now skipping mod updates for collection sourced mods
+bb77f12 Adjusted SourceId to exclude revisionNumber
+3f98391 Now displaying available updates for collections
+d04aae5 Working collection updating
+5a7bd8f Adjusted how collections handle update process
+5a72bbf No longer tracking last updated timestamps for collection mods
+2b03681 Changed "Show Updatable Mods" button to show all valid mods regardless of profile
+4b95c80 Implemented update button for collections
+6074b56 Now offering to delete orphaned collection mods after revision change
+38e5b49 Bulk i18n cleanup for unused entries
+28ab773 Fixed "Always Ask To Delete" tooltip not appearing
+0295492 Implemented SMAPI update check skipping for collection mods
+f5ba4cb Merge pull request #360 from Floogen/feature/nexus-collections
+a5b0733 Merge branch 'development' into S-zombie-patch-1
+11b1a0f Merge pull request #345 from S-zombie/S-zombie-patch-1
+0cff243 Merge branch 'development' into development
+323be48 Merge branch 'development' into add-nl-translation
+e71842a Merge pull request #347 from CuteCat233/development
+1a6d0f9 Merge branch 'development' into add-nl-translation
+154ee9a Added Dutch translation credit
+e099de2 Merge pull request #354 from JvTeylingen/add-nl-translation
+82f4199 Merge branch 'development' into patch-1
+de2e4b3 Merge pull request #357 from jbwzrd213/patch-1
+de2a107 Merge branch 'development' into development
+0cff35c Made the version ignore toggleable
+2c67182 Fixed ignore cache not being retained
+1dd3256 Now displaying when a mod is ignored
+18eaa50 Merge pull request #348 from Jvella94/development
+6fbf1bf v1.10.0-beta.1 released
+e0e3236 Update zh.json
+419e6ae Update zh.json
+bc99ebc Update zh.json
+db1d311 Merge remote-tracking branch 'upstream/development' into feat/changelog
+5e51e1a Added visibility toggle for Changelog column
+fa955df Optimized how column visibility is handled to better handle changelog toggle
+c69af2c Fixed column headers not being centered
+cfa0b46 Merge branch 'development' into feat/changelog
+93f8829 Merge pull request #353 from dazuki/feat/changelog
+6d33429 Merge pull request #361 from CuteCat233/development
+96b913a Implemented better handling for NXM protocol registration
+34221de Fixed mods update notifications not reliably grabbing until restart
+8b6b2b7 Implemented "Collection Installed Mods Path" setting
+c630c11 Adjusted Enable / Disable All Mods to only affect visible mods on the grid
+55c7f22 v1.10.0-beta.2 released
+e951914 Update zh.json
+9537881 v1.10.0 released
+081cd9a Merge branch 'Floogen:development' into development
+2cf90d7 Update zh.json
+de3e8e1 Update zh.json
+f20ebda Fixed special character handling for profile names
+b3d0f8d Fixed loss of notes and mod configs when renaming profile
+e623c75 Fixed collection names not appearing correctly in "Collections" column until restart
+f7d7283 Merge pull request #367 from CuteCat233/development
+a694f9c Merge branch 'development' of https://github.com/Floogen/Stardrop into development
+13974dd Fixed bundled collection configs not applying correctly
+e4c8b80 v1.10.1 released
+87f4cb3 Fixed update dialog window appearing under the lock window
+b827194 v1.10.2-beta.1 released
+15332a3 Discover translations from i18n files
+bf30c94 Add Bulgarian translation
+995501a Added support for installing individual mods to collection profiles
+5215f54 Adjusted collection add-on mods to be flagged differently in the UI
+acde5b3 Changed theme handling to utilize default values for missing brushes
+5e61666 Added refresh support for themes, allowing for live edits without restarting Stardrop
+b4e7d27 Added dedicated brushes for collection mod icons
+0ea2dbd Optimized mod discovery logic
+1eb42bc Merge branch 'development' into add-bulgarian-translation
+01031c4 Merge pull request #371 from AcTePuKc/add-bulgarian-translation
+1564d3e Added Bulgarian translation credit
+8205d0e Fixed Polish translation not appearing due to malformed JSON
+82798a5 Updated Nexus Mods upload action inputs to latest version
+e512449 Fixed nightly releases not being generated
+cdeade5 Fixed nightly build not updating release timestamp
+dd11c31 Added note to nightly release
+dde6bbb Added "Remove NXM Association" button to settings window
+d115b76 v1.10.2 released
+ff5de95 Changed upload order for Nexus Mods
+21f7a90 Set update_mod_version for Nexus Mods upload
+e180bc1 Implemented issue templates for bug reporting and feature requests
+d9a9c44 Update Bulgarian translation
+681397b Fix settings layout and localize grouping options
+99ec2c7 Refine Bulgarian settings labels
+10f3fbb Cleaned up logging
+d8783d0 Fixed some collections failing to download due to invalid characters in bundled files
+3e01ff5 Merge pull request #373 from AcTePuKc/update-bulgarian-translation
+32e6205 Reverted registerNXMButton's parent back to StackPanel
+667417f Reverted MessageWindow change
+ae2542d Merge pull request #374 from AcTePuKc/fix/settings-layout
+cbbe1a1 Fixed Enabled column header incorrectly displaying text
+d941c97 v1.10.3 released
+f3922c7 Fixed Nexus Mods needs for upload order
+1b7d575 Update zh.json
+595ddc8 Create default collection mods folder on startup
+c873f3e Merge pull request #376 from CuteCat233/development
+edc3851 Merge pull request #377 from dazuki/fix/default-collection-folder
+9c5e145 v1.10.4 released

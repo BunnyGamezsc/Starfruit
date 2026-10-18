@@ -1,7 +1,6 @@
 ﻿using Avalonia.Controls;
 using DynamicData;
 using DynamicData.Aggregation;
-using DynamicData.Alias;
 using DynamicData.Binding;
 using ReactiveUI;
 using Stardrop.Models.Data;
@@ -15,7 +14,7 @@ namespace Stardrop.ViewModels
     public class DownloadPanelViewModel : ViewModelBase
     {
         private ObservableCollection<ModDownloadViewModel> _downloads = new();
-        public ObservableCollection<ModDownloadViewModel> Downloads { get => _downloads; set => this.RaiseAndSetIfChanged(ref _downloads, value); }        
+        public ObservableCollection<ModDownloadViewModel> Downloads { get => _downloads; set => this.RaiseAndSetIfChanged(ref _downloads, value); }
 
         public IObservable<int> InProgressDownloads { get; init; }
 
@@ -43,7 +42,7 @@ namespace Stardrop.ViewModels
                 // Cancel all downloads and clear the dictionary, so we don't have zombie downloads from an old client lingering
                 foreach (var download in Downloads)
                 {
-                    // Trigger the cancel command, and ignore any return values (as it has none)
+                    // Trigger the cancel command and ignore any return values (as it has none)
                     download.CancelCommand.Execute().Subscribe();
                 }
                 ClearEventHandlers(oldClient);
@@ -86,7 +85,7 @@ namespace Stardrop.ViewModels
                     return;
                 }
 
-                // If it does exist, and isn't in a progress state, they're probably trying to redownload a failed download.
+                // If it does exist and isn't in a progress state, they're probably trying to redownload a failed download.
                 // Since we use the URI as our unique ID, we shouldn't have two items with the same URI in the list,
                 // so clear out the old one.
                 Downloads.Remove(existingDownload);

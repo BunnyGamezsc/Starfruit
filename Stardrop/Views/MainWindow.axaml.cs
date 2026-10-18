@@ -1,7 +1,8 @@
-using Avalonia;
+﻿using Avalonia;
 using Avalonia.Collections;
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using Avalonia.Threading;
 using DynamicData;
@@ -16,6 +17,7 @@ using Stardrop.Models.Nexus.Web;
 using Stardrop.Models.SMAPI;
 using Stardrop.Models.SMAPI.Web;
 using Stardrop.Utilities;
+using Stardrop.Utilities.Extension;
 using Stardrop.Utilities.External;
 using Stardrop.Utilities.Internal;
 using Stardrop.ViewModels;
@@ -27,8 +29,10 @@ using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using static Stardrop.Models.SMAPI.Web.ModEntryMetadata;
 
@@ -36,6 +40,13 @@ namespace Stardrop.Views
 {
     public partial class MainWindow : Window
     {
+        /// <summary>
+        /// The name SMAPI reads a settings override from when it sits in the mods folder. The alternative,
+        /// smapi-internal/config.user.json, is shared across profiles and lives in the SMAPI install rather than in
+        /// a folder Stardrop already rebuilds.
+        /// </summary>
+        private const string _smapiConfigOverrideName = "SMAPI-config.json";
+
         private readonly MainWindowViewModel _viewModel;
         private readonly ProfileEditorViewModel _editorView;
         private DispatcherTimer _searchBoxTimer;
@@ -48,6 +59,16 @@ namespace Stardrop.Views
         private bool _ctrlPressed;
 
         private string _lockReason;
+        private CancellationTokenSource? _lockCancellationSource;
+        /// <summary>The window the lock state opened, so that unlocking closes that one rather than every dialog the main window owns</summary>
+        private WarningWindow? _lockWindow;
+        /// <summary>The collections window while it is open, which is the one window an nxm link is not made to wait on</summary>
+        private CollectionsWindow? _collectionsWindow;
+
+        /// <summary>Whether a tick is still working through the links an earlier one read out of the cache file</summary>
+        private bool _isProcessingNXMLinks;
+        /// <summary>Keeps the sentinel from writing a line a second for as long as the links are being held back</summary>
+        private bool _hasLoggedNXMHold;
 
         // Session related
         private LastSessionData _lastSessionDate;
@@ -67,6 +88,11 @@ namespace Stardrop.Views
             modGrid.LoadingRow += (sender, e) => { e.Row.Header = e.Row.GetIndex() + 1; };
             modGrid.Items = _viewModel.DataView;
             modGrid.LoadingRowGroup += ModGrid_LoadingRowGroup;
+            modGrid.ColumnReordered += (sender, e) => { _viewModel.SetColumnOrder(modGrid); };
+            modGrid.AddHandler(InputElement.LostFocusEvent, OnGridLostFocus, RoutingStrategies.Bubble);
+
+            var dragOverBorder = this.FindControl<Border>("dragOverBorder");
+            dragOverBorder.AddHandler(InputElement.PointerPressedEvent, OnGridBackgroundPressed, RoutingStrategies.Tunnel);
 
             AddHandler(DragDrop.DropEvent, Drop);
             AddHandler(DragDrop.DragOverEvent, (sender, e) =>
@@ -112,15 +138,32 @@ namespace Stardrop.Views
                 }
             }
 
+            // Sets the grid's column order, based on previous session
+            if (localDataCache.ColumnOrder is not null)
+            {
+                foreach (var column in modGrid.Columns)
+                {
+                    var columnKey = ColumnExtensions.GetKey(column);
+                    if (string.IsNullOrEmpty(columnKey))
+                    {
+                        Program.helper.Log($"Failed to reorder column {column.Header.ToString()}: it lacks an ext:ColumnExtensions.Key value in the XAML.");
+                        continue;
+                    }
+                    else if (localDataCache.ColumnOrder.ContainsKey(columnKey) is false)
+                    {
+                        continue;
+                    }
+
+                    column.DisplayIndex = localDataCache.ColumnOrder[columnKey];
+                }
+            }
             // Handle the mainMenu bar for drag and related events
             var menuBorder = this.FindControl<Border>("menuBorder");
             menuBorder.PointerPressed += MainBar_PointerPressed;
             menuBorder.DoubleTapped += MainBar_DoubleTapped;
 
-            // HEADER: "Value cannot be null. (Parameter 'path1')" error clears removing the below chunk
-
             // Set profile list
-            _editorView = new ProfileEditorViewModel(Pathing.GetProfilesFolderPath());
+            _editorView = new ProfileEditorViewModel(Pathing.GetProfilesFolderPath(), _viewModel.Mods.ToList());
             var profileComboBox = this.FindControl<ComboBox>("profileComboBox");
             profileComboBox.Items = _editorView.Profiles;
             profileComboBox.SelectedIndex = 0;
@@ -171,6 +214,7 @@ namespace Stardrop.Views
             this.FindControl<Button>("saveProfileChanges").Click += SaveProfileChanges_Click;
             this.FindControl<Button>("smapiButton").Click += Smapi_Click;
             this.FindControl<CheckBox>("showUpdatableMods").Click += ShowUpdatableModsButton_Click;
+            this.FindControl<CheckBox>("showAllModSources").Click += ShowAllModSourcesButton_Click;
             this.FindControl<Button>("nexusModsButton").Click += NexusModsButton_Click;
             this.FindControl<Button>("modGroupStateButton").Click += ModGroupStateButton;
 
@@ -204,6 +248,38 @@ namespace Stardrop.Views
 #if DEBUG
             this.AttachDevTools();
 #endif
+
+            if (Design.IsDesignMode)
+            {
+                var testManifest = new Manifest() { Author = "Author", Name = "Test Mod", UniqueID = "Stardrop.TestMod", Version = "1.0.0" };
+                _viewModel.Mods.Add(new Mod(testManifest));
+            }
+        }
+
+        private void OnGridBackgroundPressed(object? sender, PointerPressedEventArgs e)
+        {
+            // Doing this to force the Note textbox to lose focus (and therefore save) when clicking elsewhere
+            if (e.Source is not TextBox textBox || !textBox.Classes.Contains("notes"))
+            {
+                // Move focus to the grid itself, pulling it off the TextBox
+                this.FindControl<DataGrid>("modGrid").Focus();
+            }
+        }
+
+        private void OnGridLostFocus(object? sender, RoutedEventArgs e)
+        {
+            // Save Note when textbox loses focus
+            if (e.Source is TextBox textBox && textBox.Classes.Contains("notes"))
+            {
+                if (Program.settings.ShouldAutomaticallySaveProfileChanges)
+                {
+                    UpdateProfile(GetCurrentProfile());
+                }
+                else
+                {
+                    _viewModel.ShowSaveProfileChanges = true;
+                }
+            }
         }
 
         private void ModGrid_LoadingRowGroup(object? sender, DataGridRowGroupHeaderEventArgs e)
@@ -223,9 +299,14 @@ namespace Stardrop.Views
             }
             else
             {
-                var searchBox = this.FindControl<TextBox>("searchBox");
-                searchBox.Focus();
-                SearchBox_KeyUp(sender, e);
+                // Only grab search box if not currently typing in notes
+                var focusedElement = FocusManager.Instance?.Current;
+                if (focusedElement is not null && (focusedElement is not TextBox textBox || !textBox.Classes.Contains("notes")))
+                {
+                    var searchBox = this.FindControl<TextBox>("searchBox");
+                    searchBox.Focus();
+                    SearchBox_KeyUp(sender, e);
+                }
             }
         }
 
@@ -321,7 +402,7 @@ namespace Stardrop.Views
                 var requestWindow = new MessageWindow(Program.translation.Get("ui.message.stardrop_update_complete"));
                 if (await requestWindow.ShowDialog<bool>(this))
                 {
-                    _viewModel.OpenBrowser("https://github.com/Floogen/Stardrop/releases/latest");
+                    Toolkit.OpenBrowser("https://github.com/Floogen/Stardrop/releases/latest");
                 }
 
                 Program.settings.Version = _viewModel.Version.Replace("v", String.Empty);
@@ -336,11 +417,14 @@ namespace Stardrop.Views
                 await HandleSMAPIUpdateCheck(false);
             }
 
-
             // Register a handler to watch whenever the Nexus client changes, so setpu and teardown get handled automatically
             Nexus.ClientChanged += NexusClientChanged;
 
-            // Set up the Nexus Mods connection, and attempt to register for the NXM URI protocol
+            // Shown from the cache first, so last session's answer is on screen whether or not the check below can
+            // reach Nexus at all
+            RefreshCollectionUpdateCount();
+
+            // Set up the Nexus Mods connection and attempt to register for the NXM URI protocol
             await CheckForNexusConnection();
 
             if (String.IsNullOrEmpty(Program.nxmLink) is false)
@@ -353,9 +437,16 @@ namespace Stardrop.Views
             SetupDownloadCountListener();
         }
 
-        private async Task CreateWarningWindow(string warningText, string buttonText)
+        /// <summary>
+        /// Opens a warning window. Pass a wider windowWidth for messages carrying lists rather than a single line,
+        /// which also switches the text to left aligned. Pass enableHyperlinks for messages that may hold web
+        /// addresses, such as anything sourced from a collection's curator.
+        /// </summary>
+        private async Task CreateWarningWindow(string warningText, string buttonText, double? windowWidth = null, bool enableHyperlinks = false)
         {
-            var warningWindow = new WarningWindow(warningText, buttonText);
+            var warningWindow = new WarningWindow(warningText, buttonText, windowWidth, enableHyperlinks);
+            KeepDialogAboveSiblings(warningWindow);
+
             await warningWindow.ShowDialog(this);
         }
 
@@ -372,7 +463,14 @@ namespace Stardrop.Views
                 return;
             }
 
-            var addedMods = await AddMods(e.Data.GetFileNames()?.ToArray());
+            var installTarget = await ResolveModInstallTarget();
+            if (installTarget.Proceed is false)
+            {
+                _viewModel.DragOverColor = "#ff9f2a";
+                return;
+            }
+
+            var addedMods = await AddMods(e.Data.GetFileNames()?.ToArray(), installTarget.InstallPathOverride);
 
             // TODO: Add optional setting to disable checking for updates when a new mod is installed?
             await CheckForModUpdates(addedMods, useCache: true, skipCacheCheck: true);
@@ -412,6 +510,24 @@ namespace Stardrop.Views
                 return;
             }
 
+            // Handling a link locks the main window, and a lock arriving under a dialog would close it out from
+            // underneath whoever is waiting on it. The links stay in the cache file until the way is clear rather
+            // than being read out and dropped, as a collection's summary is exactly the window a user is looking at
+            // while they fetch the downloads it lists
+            if (_isProcessingNXMLinks || _viewModel.IsLocked || IsBlockedByOpenWindow())
+            {
+                if (_hasLoggedNXMHold is false)
+                {
+                    Program.helper.Log($"Holding the pending NXM link(s), as the main window is busy or has a window open over it", Helper.Status.Debug);
+                    _hasLoggedNXMHold = true;
+                }
+
+                return;
+            }
+
+            _hasLoggedNXMHold = false;
+            _isProcessingNXMLinks = true;
+
             try
             {
                 var nxmLinks = new List<NXM>();
@@ -419,9 +535,13 @@ namespace Stardrop.Views
                 // Gather the NXM links, then clear the file
                 using (FileStream stream = new FileStream(Pathing.GetLinksCachePath(), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
                 {
-                    foreach (var nxmLink in await JsonSerializer.DeserializeAsync<List<NXM>>(stream, new JsonSerializerOptions { AllowTrailingCommas = true }))
+                    var pendingLinks = await JsonSerializer.DeserializeAsync<List<NXM>>(stream, new JsonSerializerOptions { AllowTrailingCommas = true });
+                    if (pendingLinks is not null)
                     {
-                        nxmLinks.Add(nxmLink);
+                        foreach (var nxmLink in pendingLinks)
+                        {
+                            nxmLinks.Add(nxmLink);
+                        }
                     }
 
                     // Clear the stream and empty out the file
@@ -433,7 +553,9 @@ namespace Stardrop.Views
                 // Process each link
                 foreach (var nxmLink in nxmLinks)
                 {
-                    if (await ProcessNXMLink(nxmLink) is false)
+                    // Only a blocked link stops the run. A single mod failing or being backed out of says nothing
+                    // about the ones queued behind it, which the user asked for just as deliberately
+                    if (await ProcessNXMLink(nxmLink) is NXMLinkResult.Blocked)
                     {
                         break;
                     }
@@ -460,17 +582,40 @@ namespace Stardrop.Views
                     Program.helper.Log($"Failed to delete the Links.json file: {ioEx}");
                 }
             }
+            finally
+            {
+                _isProcessingNXMLinks = false;
+            }
         }
 
         private async void _lockSentinelTimer_Tick(object? sender, EventArgs e)
         {
-            if (this.OwnedWindows.Any(w => w is WarningWindow) is false && _viewModel.IsLocked && String.IsNullOrEmpty(_lockReason) is false)
+            if (_lockWindow is not null || HasOpenDialog() || _viewModel.IsLocked is false || String.IsNullOrEmpty(_lockReason))
             {
-                Program.helper.Log($"Detected lock state request ({_lockReason}): Locking main window!");
+                return;
+            }
 
-                var warningWindow = new WarningWindow(_lockReason, _viewModel);
-                warningWindow.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            Program.helper.Log($"Detected lock state request ({_lockReason}): Locking main window!");
+
+            var warningWindow = new WarningWindow(_lockReason, _viewModel, cancellationSource: _lockCancellationSource);
+            warningWindow.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            KeepDialogAboveSiblings(warningWindow);
+
+            // Held onto so that SetLockState and UpdateLockWindow have this window to work with, rather than
+            // reaching for whichever one the main window happens to own at the time
+            _lockWindow = warningWindow;
+
+            try
+            {
                 await warningWindow.ShowDialog(this);
+            }
+            finally
+            {
+                // Only when it is still the current one, since SetLockState may already have replaced it
+                if (ReferenceEquals(_lockWindow, warningWindow))
+                {
+                    _lockWindow = null;
+                }
             }
         }
 
@@ -597,7 +742,7 @@ namespace Stardrop.Views
                 return;
             }
 
-            _viewModel.OpenBrowser(selectedMod.ModPageUri);
+            Toolkit.OpenBrowser(selectedMod.ModPageUri);
         }
 
         private void ModGridMenuRow_ShowWholeModGroup(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
@@ -715,6 +860,83 @@ namespace Stardrop.Views
             }
         }
 
+        /// <summary>
+        /// Toggles whether the currently suggested update for a mod is ignored. A toggle rather than a one-way
+        /// action, as gating the menu item on anything that folds the ignore in would take the only means of
+        /// reversing a misclick away with it.
+        ///
+        /// The ignore is version scoped and stored globally in the client data cache, keyed on unique ID. It lapses
+        /// on its own once a version newer than the ignored one is suggested, which CheckForModUpdates handles.
+        /// </summary>
+        private async void ModGridMenuRow_IgnoreUpdate(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        {
+            if ((sender as MenuItem)?.DataContext is not Mod selectedMod)
+            {
+                return;
+            }
+
+            // Guarded rather than assumed, as the menu item is only offered when there is an update to act on
+            if (selectedMod.HasNewerVersion is false)
+            {
+                return;
+            }
+
+            if (selectedMod.IsUpdateIgnored)
+            {
+                selectedMod.IgnoredVersion = null;
+            }
+            else
+            {
+                selectedMod.IgnoredVersion = selectedMod.SuggestedVersion;
+            }
+
+            // Persist the ignored version globally to the client data cache. Not to the profile, as an ignore is not
+            // profile scoped, so nothing here should mark the profile as having unsaved changes
+            try
+            {
+                ClientData clientData = new ClientData();
+                if (File.Exists(Pathing.GetDataCachePath()))
+                {
+                    try
+                    {
+                        clientData = JsonSerializer.Deserialize<ClientData>(File.ReadAllText(Pathing.GetDataCachePath()), new JsonSerializerOptions { AllowTrailingCommas = true }) ?? new ClientData();
+                    }
+                    catch
+                    {
+                        clientData = new ClientData();
+                    }
+                }
+
+                if (String.IsNullOrEmpty(selectedMod.IgnoredVersion))
+                {
+                    if (clientData.IgnoredUpdates.ContainsKey(selectedMod.UniqueId))
+                    {
+                        clientData.IgnoredUpdates.Remove(selectedMod.UniqueId);
+                    }
+                }
+                else
+                {
+                    clientData.IgnoredUpdates[selectedMod.UniqueId] = selectedMod.IgnoredVersion;
+                }
+
+                File.WriteAllText(Pathing.GetDataCachePath(), JsonSerializer.Serialize(clientData, new JsonSerializerOptions() { WriteIndented = true }));
+            }
+            catch (Exception ex)
+            {
+                Program.helper.Log($"Failed to persist the ignored update for {selectedMod.UniqueId}: {ex}");
+            }
+
+            // Awaited rather than blocked on, as this runs on the UI thread
+            try
+            {
+                await GetCachedModUpdates(_viewModel.Mods.ToList(), skipCacheCheck: true);
+            }
+            catch (Exception ex)
+            {
+                Program.helper.Log($"Failed to refresh the update count after toggling the ignored update for {selectedMod.UniqueId}, so it will correct on the next update check: {ex}", Helper.Status.Warning);
+            }
+        }
+
         private void SearchBox_KeyUp(object? sender, KeyEventArgs e)
         {
             if (_searchBoxTimer is null)
@@ -781,6 +1003,17 @@ namespace Stardrop.Views
             _viewModel.ShowUpdatableMods = (bool)showUpdatableModsCheckBox.IsChecked;
         }
 
+        private void ShowAllModSourcesButton_Click(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        {
+            var showAllModSourcesCheckBox = e.Source as CheckBox;
+            if (showAllModSourcesCheckBox is null)
+            {
+                return;
+            }
+
+            _viewModel.ModSourceFilter = showAllModSourcesCheckBox.IsChecked is true ? ModSourceFilter.All : ModSourceFilter.ActiveProfile;
+        }
+
         private async void ProfileComboBox_SelectionChanged(object? sender, SelectionChangedEventArgs e)
         {
             var profile = (e.Source as ComboBox).SelectedItem as Profile;
@@ -809,8 +1042,7 @@ namespace Stardrop.Views
             // Enable the mods for the selected profile
             _viewModel.EnableModsByProfile(profile);
 
-            // Update the EnabledModCount
-            _viewModel.EnabledModCount = _viewModel.Mods.Where(m => m.IsEnabled && !m.IsHidden).Count();
+            _viewModel.RefreshModCounts();
 
             Program.settings.ShouldWriteToModConfigs = true;
         }
@@ -862,6 +1094,46 @@ namespace Stardrop.Views
             }
         }
 
+        private async void ChangelogButton_Click(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        {
+            var button = e.Source as Button;
+            if (button is null)
+            {
+                return;
+            }
+
+            var clickedMod = _viewModel.Mods.FirstOrDefault(m => m.UniqueId.Equals(button.Tag));
+            if (clickedMod is null || clickedMod.ChangelogState is not ChangelogState.Unknown)
+            {
+                return;
+            }
+
+            var modId = clickedMod.GetNexusId();
+            if (modId is null || Nexus.Client is null)
+            {
+                await CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.unable_nexus_changelog"), clickedMod.Name), Program.translation.Get("internal.ok"));
+                return;
+            }
+
+            clickedMod.ChangelogState = ChangelogState.Fetching;
+            try
+            {
+                // Show the window before fetching, so the user gets a loading spinner instead of a
+                // frozen-looking grid while Nexus responds.
+                var changelogWindow = new ChangelogWindow(clickedMod.Name, clickedMod.ModPageUri);
+                changelogWindow.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+
+                var dialog = changelogWindow.ShowDialog(this);
+                changelogWindow.SetChangelogs(await Nexus.Client.GetModChangelogs(modId.Value));
+
+                await dialog;
+            }
+            finally
+            {
+                clickedMod.ChangelogState = ChangelogState.Unknown;
+            }
+        }
+
         private async void InstallButton_Click(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
         {
             var button = e.Source as Button;
@@ -871,8 +1143,8 @@ namespace Stardrop.Views
                 return;
             }
 
-            // Get the mod based on the checkbox's content (which contains the UniqueId)
-            var clickedMod = _viewModel.Mods.FirstOrDefault(m => m.UniqueId.Equals(button.Tag));
+            // Take the mod from the row's own data context, as a unique ID lookup can land on a collection copy
+            var clickedMod = button.DataContext as Mod;
             if (clickedMod is null)
             {
                 return;
@@ -909,8 +1181,10 @@ namespace Stardrop.Views
                 return;
             }
 
-            // Get the mod based on the checkbox's content (which contains the UniqueId)
-            var clickedMod = _viewModel.Mods.FirstOrDefault(m => m.UniqueId.Equals(checkBox.Content));
+            // Taken from the row the checkbox belongs to rather than looked up by unique ID. A collection can pin
+            // a mod the user also has installed loosely, so that ID matches more than one mod and the lookup was
+            // free to return the copy that was not clicked
+            var clickedMod = checkBox.DataContext as Mod;
             if (clickedMod is not null)
             {
                 // Add the selected mod into the selection list if shift or ctrl is held, otherwise clear the current selection
@@ -920,7 +1194,13 @@ namespace Stardrop.Views
                     {
                         modGrid.SelectedItems.Clear();
                     }
-                    modGrid.SelectedItems.Add(clickedMod);
+
+                    // Guarded, as SelectedItems is validated against the filtered view rather than the mod list and
+                    // throws for anything the current filter is hiding
+                    if (_viewModel.DataView.Contains(clickedMod))
+                    {
+                        modGrid.SelectedItems.Add(clickedMod);
+                    }
                 }
 
                 // Enable / disable all selected mods based on the clicked mod
@@ -939,6 +1219,13 @@ namespace Stardrop.Views
                         DisableRequirements(mod);
                     }
                 }
+
+                // Turning a copy on stands the others down rather than sitting alongside them, as only one folder
+                // per unique ID can be linked into the mods folder
+                if (clickedMod.IsEnabled)
+                {
+                    _viewModel.DisableDuplicatesOf(modGrid.SelectedItems.OfType<Mod>().ToList());
+                }
             }
 
             if (Program.settings.ShouldAutomaticallySaveProfileChanges)
@@ -956,7 +1243,7 @@ namespace Stardrop.Views
             var profileComboBox = this.FindControl<ComboBox>("profileComboBox");
             var oldProfile = profileComboBox.SelectedItem as Profile;
 
-            var editorWindow = new ProfileEditor(_editorView);
+            var editorWindow = new ProfileEditor(_editorView, _viewModel.DirectModInstallAsync, HandleModListRefresh);
             editorWindow.WindowStartupLocation = WindowStartupLocation.CenterOwner;
             await editorWindow.ShowDialog(this);
 
@@ -976,19 +1263,34 @@ namespace Stardrop.Views
             var profileComboBox = this.FindControl<ComboBox>("profileComboBox");
             var profile = profileComboBox.SelectedItem as Profile;
 
-            if (profile is not null)
+            if (profile is null)
             {
-                _viewModel.DiscoverConfigs(Pathing.defaultModPath, useArchive: true);
-                _viewModel.ReadModConfigs(profile, _viewModel.GetPendingConfigUpdates(profile));
-                UpdateProfile(profile);
-
-                if (!Program.settings.EnableProfileSpecificModConfigs)
-                {
-                    CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.mod_config_saved_but_not_enabled"), profile.Name), Program.translation.Get("internal.ok"));
-                }
-
-                Program.settings.ShouldWriteToModConfigs = true;
+                return;
             }
+
+            _viewModel.DiscoverConfigs(Pathing.defaultModPath, useArchive: true);
+
+            // Nothing to preserve leaves the button looking broken rather than finished, so the two reasons a
+            // profile can come back empty are named apart. A collection owning every configuration on screen is the
+            // confusing one, as the grid plainly shows mods carrying configuration
+            var pendingConfigUpdates = _viewModel.GetPendingConfigUpdates(profile);
+            if (pendingConfigUpdates.Count == 0)
+            {
+                var reason = _viewModel.HasCollectionOwnedConfigs(profile) ? "ui.warning.no_mod_configs_to_save_collection" : "ui.warning.no_mod_configs_to_save";
+                CreateWarningWindow(String.Format(Program.translation.Get(reason), profile.Name), Program.translation.Get("internal.ok"));
+
+                return;
+            }
+
+            _viewModel.ReadModConfigs(profile, pendingConfigUpdates);
+            UpdateProfile(profile);
+
+            if (!Program.settings.EnableProfileSpecificModConfigs)
+            {
+                CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.mod_config_saved_but_not_enabled"), profile.Name), Program.translation.Get("internal.ok"));
+            }
+
+            Program.settings.ShouldWriteToModConfigs = true;
         }
 
         private void ModGroupStateButton(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
@@ -1067,6 +1369,16 @@ namespace Stardrop.Views
         private async void Settings_Click(object? sender, EventArgs e)
         {
             await DisplaySettingsWindow();
+        }
+
+        private async void Collections_Click(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        {
+            await DisplayCollectionsWindow();
+        }
+
+        private async void Collections_Click(object? sender, EventArgs e)
+        {
+            await DisplayCollectionsWindow();
         }
 
         private void LogFile_Click(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
@@ -1279,7 +1591,20 @@ namespace Stardrop.Views
             dialog.Filters.Add(new FileDialogFilter() { Name = "Mod Archive (*.zip, *.7z, *.rar)", Extensions = { "zip", "7z", "rar" } });
             dialog.AllowMultiple = true;
 
-            var addedMods = await AddMods(await dialog.ShowAsync(this));
+            // Resolved after the files are chosen
+            var filePaths = await dialog.ShowAsync(this);
+            if (filePaths is null || filePaths.Length == 0)
+            {
+                return;
+            }
+
+            var installTarget = await ResolveModInstallTarget();
+            if (installTarget.Proceed is false)
+            {
+                return;
+            }
+
+            var addedMods = await AddMods(filePaths, installTarget.InstallPathOverride);
 
             await CheckForModUpdates(addedMods, useCache: true, skipCacheCheck: true);
             await GetCachedModUpdates(_viewModel.Mods.ToList(), skipCacheCheck: true);
@@ -1303,6 +1628,79 @@ namespace Stardrop.Views
                 _viewModel.AreModGroupsEnabled = Program.settings.ModGroupingMethod != ModGrouping.None;
                 _viewModel.ShowModThumbnails = Program.settings.ShowModThumbnails;
             }
+        }
+
+        /// <summary>
+        /// Opens the collections window. It reads the cached records itself, so the only things handed to it are the
+        /// profile list, since removing a collection has to deal with the profile that was generated for it, and a
+        /// callback for putting the grid back in order afterwards.
+        /// </summary>
+        private async Task DisplayCollectionsWindow()
+        {
+            Program.helper.Log($"Opening collections window");
+
+            var collectionsWindow = new CollectionsWindow(_editorView, HandleCollectionRemoved, HandleCollectionFileDrop, HandleCollectionRefresh, HandleCollectionUpdate);
+            collectionsWindow.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+
+            // Held so that an arriving nxm link can tell this window apart from a dialog waiting on an answer, and
+            // so that anything installed while it is open can put it back in step
+            _collectionsWindow = collectionsWindow;
+
+            try
+            {
+                await collectionsWindow.ShowDialog(this);
+            }
+            finally
+            {
+                _collectionsWindow = null;
+            }
+        }
+
+        /// <summary>
+        /// Rebuilds the grid after a collection is removed. Its mod folder went with it, so the list has to be
+        /// discovered again before any profile is applied against it, and the selection has to fall back where the
+        /// profile that was selected is one of the things that just went away.
+        /// </summary>
+        /// <summary>
+        /// Re-runs the revision check for the collections window's refresh button, forced past the once-a-session
+        /// guard since the user asking for it is the whole point.
+        /// </summary>
+        private async Task HandleCollectionRefresh()
+        {
+            await CheckForCollectionUpdates(forceCheck: true);
+        }
+
+        /// <summary>
+        /// Applies a revision for the collections window's update button. Goes through the same path an nxm link
+        /// does, including the confirmation, so the two routes cannot drift apart.
+        /// </summary>
+        private async Task HandleCollectionUpdate(string domainName, string slug, int? revisionNumber)
+        {
+            await InstallOrUpdateCollection(domainName, slug, revisionNumber);
+        }
+
+        private void HandleCollectionRemoved()
+        {
+            var profileComboBox = this.FindControl<ComboBox>("profileComboBox");
+            var selectedProfile = profileComboBox.SelectedItem as Profile;
+
+            _viewModel.DiscoverMods(Pathing.defaultModPath);
+
+            // Applied by hand where the profile survived, as it is the same instance and reassigning it would raise
+            // nothing, leaving every freshly discovered mod disabled
+            if (selectedProfile is not null && _editorView.Profiles.Contains(selectedProfile))
+            {
+                _viewModel.EnableModsByProfile(selectedProfile);
+            }
+            else
+            {
+                profileComboBox.SelectedIndex = 0;
+            }
+
+            _viewModel.RefreshModCounts();
+            _viewModel.UpdateFilter();
+
+            RefreshCollectionUpdateCount();
         }
 
         private async Task HandleStardropUpdateCheck(bool manualCheck = false)
@@ -1533,7 +1931,7 @@ namespace Stardrop.Views
                 var requestWindow = new MessageWindow(Program.translation.Get("ui.message.SMAPI_update_complete"));
                 if (await requestWindow.ShowDialog<bool>(this))
                 {
-                    _viewModel.OpenBrowser($"https://smapi.io/release/{latestSmapiToUri?.Key.Replace(".", String.Empty)}");
+                    Toolkit.OpenBrowser($"https://smapi.io/release/{latestSmapiToUri?.Key.Replace(".", String.Empty)}");
                 }
             }
             else if (manualCheck is true)
@@ -1550,30 +1948,104 @@ namespace Stardrop.Views
                 return;
             }
 
-            if (_viewModel.IsCheckingForUpdates is false)
+            if (_viewModel.IsCheckingForUpdates is true)
             {
+                return;
+            }
+
+            // Ahead of the lock rather than left to CheckForModUpdates, which no longer runs before the lock window
+            // is up. An open menu sitting under a modal is not something the user can dismiss
+            CloseMainMenu();
+
+            // The rescan below and the work that follows the fetch both run on the dispatcher, so the window stops
+            // repainting for the duration. The lock window at least names what is happening rather than leaving a
+            // dead window behind, and it keeps an nxm link from starting an install underneath the rescan
+            SetLockState(true, Program.translation.Get("ui.warning.mod_update_scanning"));
+
+            // The lock window is opened by the lock sentinel rather than by SetLockState, so it needs a turn of the
+            // dispatcher to appear before the scan takes the thread
+            await YieldToLockWindow();
+
+            try
+            {
+                // A rescan rebuilds every Mod instance, so anything the user has toggled or noted without saving to
+                // their profile would be dropped on the way through. Captured and reapplied over the profile
+                // afterwards, as an update check has no business reverting a pending change
+                var pendingProfileState = _viewModel.ShowSaveProfileChanges ? _viewModel.Mods.Select(m => (Reference: m.ToReference(), m.IsEnabled, m.Note)).ToList() : null;
+
+                _viewModel.DiscoverMods(Pathing.defaultModPath);
+                _viewModel.EnableModsByProfile(GetCurrentProfile());
+
+                if (pendingProfileState is not null)
+                {
+                    foreach (var mod in _viewModel.Mods)
+                    {
+                        var pendingState = pendingProfileState.FirstOrDefault(p => p.Reference.Matches(mod));
+                        if (pendingState.Reference is null)
+                        {
+                            continue;
+                        }
+
+                        mod.IsEnabled = pendingState.IsEnabled;
+                        mod.Note = pendingState.Note;
+                    }
+
+                    _viewModel.RefreshModCounts();
+                }
+
                 await CheckForModUpdates(_viewModel.Mods.ToList());
+            }
+            finally
+            {
+                // In a finally, as CheckForModUpdates has early returns of its own and leaving the window locked
+                // would take the whole application with it
+                SetLockState(false);
             }
         }
 
         private async Task HandleBulkModStateChange(bool enableState)
         {
-            var requestWindow = new MessageWindow(enableState ? Program.translation.Get("ui.message.confirm_bulk_change_mod_states_enable") : Program.translation.Get("ui.message.confirm_bulk_change_mod_states_disable"));
-            if (await requestWindow.ShowDialog<bool>(this))
+            // Scoped to what the grid is showing rather than to every discovered mod, so a collection profile, a
+            // search term or an enabled filter each narrow this the same way they narrow the view
+            var targetMods = _viewModel.GetVisibleMods().Where(m => m.IsEnabled != enableState).ToList();
+            if (targetMods.Count == 0)
             {
-                foreach (var mod in _viewModel.Mods.Where(m => m.IsEnabled != enableState))
-                {
-                    mod.IsEnabled = enableState;
-                }
+                await CreateWarningWindow(Program.translation.Get("ui.warning.no_mods_to_change"), Program.translation.Get("internal.ok"));
+                return;
+            }
 
-                if (Program.settings.ShouldAutomaticallySaveProfileChanges)
-                {
-                    UpdateProfile(GetCurrentProfile());
-                }
-                else
-                {
-                    _viewModel.ShowSaveProfileChanges = true;
-                }
+            // The count is of the mods that will actually change rather than of everything on screen, as confirming
+            // against a total that is mostly already in the requested state says nothing useful
+            var requestWindow = new MessageWindow(String.Format(Program.translation.Get(enableState ? "ui.message.confirm_bulk_change_mod_states_enable" : "ui.message.confirm_bulk_change_mod_states_disable"), targetMods.Count));
+            if (await requestWindow.ShowDialog<bool>(this) is false)
+            {
+                return;
+            }
+
+            foreach (var mod in targetMods)
+            {
+                mod.IsEnabled = enableState;
+            }
+
+            // Every copy of a mod that a collection and the mod folder both provide has just been turned on,
+            // so the unique IDs have to be collapsed back down to one enabled copy each
+            if (enableState)
+            {
+                _viewModel.ResolveEnabledDuplicates();
+            }
+
+            // Outside the branch above, as the footer follows the enabled count in both directions. Only the enable
+            // path refreshed it before, which left the count stale after a disable whenever the profile was not being
+            // saved automatically, since saving is what otherwise reaches RefreshModCounts
+            _viewModel.RefreshModCounts();
+
+            if (Program.settings.ShouldAutomaticallySaveProfileChanges)
+            {
+                UpdateProfile(GetCurrentProfile());
+            }
+            else
+            {
+                _viewModel.ShowSaveProfileChanges = true;
             }
         }
 
@@ -1703,29 +2175,48 @@ namespace Stardrop.Views
             _viewModel.HideRequiredMods();
         }
 
-        internal async Task<bool> ProcessNXMLink(NXM nxmLink)
+        internal async Task<NXMLinkResult> ProcessNXMLink(NXM nxmLink)
         {
+            // An nxm link arrives unannounced, so it waits its turn rather than starting an install underneath
+            // whatever the user is currently in the middle of
+            await WaitForMainWindowToBeFree();
 
             if (Nexus.Client is null)
             {
                 await CreateWarningWindow(Program.translation.Get("ui.message.require_nexus_login"), Program.translation.Get("internal.ok"));
-                return false;
+                return NXMLinkResult.Blocked;
+            }
+
+            // Collection links follow an entirely different flow, so split them off before the mod handling below
+            if (nxmLink.ResolvePurpose() is NXM.NXMPurpose.Collection)
+            {
+                if (await ValidateSMAPIPath() is false)
+                {
+                    return NXMLinkResult.Blocked;
+                }
+
+                return await ProcessCollectionLink(nxmLink) ? NXMLinkResult.Success : NXMLinkResult.Failed;
             }
 
 
             if (await ValidateSMAPIPath() is false)
             {
-                return false;
+                return NXMLinkResult.Blocked;
             }
 
-            Program.helper.Log($"Processing NXM link: {nxmLink.Link}");
-            var processedDownloadLink = await Nexus.Client.GetFileDownloadLink(nxmLink, EnumParser.GetDescription(Program.settings.PreferredNexusServer));
-            Program.helper.Log($"Processed link: {processedDownloadLink}");
+            // A file that a collection is still waiting on installs into that collection rather than loose, which is
+            // the only route a non-premium account has into one Stardrop could not fetch on its behalf
+            var entryLinkResult = await TryProcessCollectionEntryLink(nxmLink);
+            if (entryLinkResult is CollectionEntryLinkResult.Handled)
+            {
+                return NXMLinkResult.Success;
+            }
 
+            var processedDownloadLink = await Nexus.Client.GetFileDownloadLink(nxmLink, EnumParser.GetDescription(Program.settings.PreferredNexusServer));
             if (String.IsNullOrEmpty(processedDownloadLink))
             {
                 await CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.failed_to_get_download_link"), nxmLink.Link), Program.translation.Get("internal.ok"));
-                return false;
+                return NXMLinkResult.Failed;
             }
 
             // Get the mod details
@@ -1733,7 +2224,7 @@ namespace Stardrop.Views
             if (modDetails is null || String.IsNullOrEmpty(modDetails.Name))
             {
                 await CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.failed_to_get_mod_details"), nxmLink.Link), Program.translation.Get("internal.ok"));
-                return false;
+                return NXMLinkResult.Failed;
             }
 
             bool? fileSafetyResults = await Nexus.Client.ValidateFileSafety(nxmLink);
@@ -1742,33 +2233,41 @@ namespace Stardrop.Views
                 // Unable to verify mod scan status on Nexus Mods, ask user if they want to continue
                 if (await new MessageWindow(Program.translation.Get("ui.warning.failed_to_verify_mod_file")).ShowDialog<bool>(this) is false)
                 {
-                    return false;
+                    return NXMLinkResult.Canceled;
                 }
             }
             else if (fileSafetyResults is false)
             {
                 // Reject downloading any quarantined mods on Nexus Mods
                 await CreateWarningWindow(Program.translation.Get("ui.warning.file_quarantined"), Program.translation.Get("internal.ok"));
-                return false;
+                return NXMLinkResult.Failed;
             }
 
             var requestWindow = new MessageWindow(String.Format(Program.translation.Get("ui.message.confirm_nxm_install"), modDetails.Name));
             if (Program.settings.IsAskingBeforeAcceptingNXM is false || await requestWindow.ShowDialog<bool>(this))
             {
+                // Asked before the download rather than after, so backing out costs nothing. A link the
+                // user has already declined capturing into a collection skips the question
+                var installTarget = await ResolveModInstallTarget(skipPrompt: entryLinkResult is CollectionEntryLinkResult.Declined);
+                if (installTarget.Proceed is false)
+                {
+                    return NXMLinkResult.Canceled;
+                }
+
                 var downloadResult = await Nexus.Client.DownloadFileAndGetPath(processedDownloadLink, modDetails.Name);
                 if (downloadResult.ResultKind is DownloadResultKind.Failed)
                 {
                     await CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.failed_nexus_install"), modDetails.Name), Program.translation.Get("internal.ok"));
-                    return false;
+                    return NXMLinkResult.Failed;
                 }
                 if (downloadResult.ResultKind is DownloadResultKind.UserCanceled)
                 {
                     // No need for a warning, this is something the user chose intentionally
-                    return false;
+                    return NXMLinkResult.Canceled;
                 }
                 string downloadedFilePath = downloadResult.DownloadedModFilePath!;
 
-                var addedMods = await AddMods(new string[] { downloadedFilePath });
+                var addedMods = await AddMods(new string[] { downloadedFilePath }, installTarget.InstallPathOverride);
                 await CheckForModUpdates(addedMods, useCache: true, skipCacheCheck: true);
                 await GetCachedModUpdates(_viewModel.Mods.ToList(), skipCacheCheck: true);
 
@@ -1784,19 +2283,102 @@ namespace Stardrop.Views
 
                 // Let the user know that the mod was installed via NXM
                 await CreateWarningWindow(String.Format(Program.translation.Get("ui.message.succeeded_nexus_install"), modDetails.Name), Program.translation.Get("internal.ok"));
+
+                return NXMLinkResult.Success;
             }
 
-            return true;
+            // Declining the confirmation is a choice rather than a fault, so the links behind it still go ahead
+            return NXMLinkResult.Canceled;
         }
 
-        private void SetLockState(bool isWindowLocked, string? lockReason = null)
+        /// <summary>
+        /// Waits until nothing is sitting over the main window. Installing locks the window, and a lock closes the
+        /// lock window, so starting one while a dialog is open would close that dialog out from underneath whoever
+        /// is waiting on its answer.
+        /// </summary>
+        private async Task WaitForMainWindowToBeFree()
+        {
+            if (_viewModel.IsLocked is false && IsBlockedByOpenWindow() is false)
+            {
+                return;
+            }
+
+            Program.helper.Log($"Waiting for the main window to be free before handling an NXM link");
+
+            while (_viewModel.IsLocked || IsBlockedByOpenWindow())
+            {
+                await Task.Delay(500);
+            }
+        }
+
+        /// <summary>
+        /// Whether anything the main window owns would be disturbed by an install starting. The collections window
+        /// is left out, as fetching the entries a collection is missing is the whole reason it exists: holding the
+        /// links it produces until it closes leaves the user clicking through mods to no visible effect.
+        /// </summary>
+        private bool IsBlockedByOpenWindow()
+        {
+            return this.OwnedWindows.Any(w => ReferenceEquals(w, _collectionsWindow) is false);
+        }
+
+        /// <summary>
+        /// Puts a dialog above the ones the main window already owns. Two dialogs sharing an owner have no order
+        /// between them, so one opened while another is up can land behind it. Left alone when there is nothing to
+        /// sit above, since a topmost window would otherwise float over other applications.
+        /// </summary>
+        private void KeepDialogAboveSiblings(Window dialog)
+        {
+            dialog.Topmost = OwnedWindows.Any(w => ReferenceEquals(w, dialog) is false);
+        }
+
+        private bool HasOpenDialog()
+        {
+            return OwnedWindows.Any(w => ReferenceEquals(w, _collectionsWindow) is false);
+        }
+
+        /// <summary>
+        /// Shows a dialog over the lock window.
+        /// </summary>
+        private async Task<T> ShowDialogOverLock<T>(Window dialog)
+        {
+            var lockWindow = _lockWindow;
+            if (lockWindow is not null)
+            {
+                lockWindow.Topmost = false;
+            }
+
+            try
+            {
+                return await dialog.ShowDialog<T>(this);
+            }
+            finally
+            {
+                // Only where it is still the current one, as SetLockState may have closed it while the dialog was open
+                if (lockWindow is not null && ReferenceEquals(_lockWindow, lockWindow))
+                {
+                    KeepDialogAboveSiblings(lockWindow);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Locks or unlocks the main window. The lock window itself is opened by the sentinel timer from this state,
+        /// so calling UpdateLockWindow without having called this first does nothing.
+        /// </summary>
+        /// <param name="cancellationSource">Supply one to give the lock window a cancel button wired to it</param>
+        private void SetLockState(bool isWindowLocked, string? lockReason = null, CancellationTokenSource? cancellationSource = null)
         {
             _viewModel.IsLocked = isWindowLocked;
             _lockReason = lockReason is null ? String.Empty : lockReason;
+            _lockCancellationSource = isWindowLocked ? cancellationSource : null;
 
-            foreach (var ownedWindow in this.OwnedWindows.ToList())
+            // Only the window this state opened. Closing everything the main window owns takes any dialog the user
+            // is partway through with it, and an awaited ShowDialog closed from underneath returns the same result
+            // as the user dismissing it, so its caller carries on as though they had answered
+            if (_lockWindow is not null)
             {
-                ownedWindow.Close();
+                _lockWindow.Close();
+                _lockWindow = null;
             }
         }
 
@@ -1808,20 +2390,76 @@ namespace Stardrop.Views
                 return;
             }
 
-            WarningWindow? lockWindow = OwnedWindows.FirstOrDefault(w => w is WarningWindow) as WarningWindow;
-            if (lockWindow is null)
+            if (_lockWindow is null)
             {
                 return;
             }
 
             Program.helper.Log($"Successfully updated lock window!");
-            lockWindow.UpdateProgress(lockReason, progress, maxProgress);
+            _lockWindow.UpdateProgress(lockReason, progress, maxProgress);
+        }
+
+        /// <summary>Closes the main menu, which otherwise stays open for as long as the handler behind it runs</summary>
+        private void CloseMainMenu()
+        {
+            var mainMenu = this.FindControl<Menu>("mainMenu");
+            if (mainMenu is not null && mainMenu.IsOpen)
+            {
+                mainMenu.Close();
+            }
+        }
+
+        /// <summary>
+        /// Names the phase on the lock window and gives it a turn of the dispatcher to repaint before the next one
+        /// takes the thread. Does nothing when the window is not locked, which covers every caller of the update
+        /// check bar the manual one, so those pay neither the update nor the yield.
+        /// </summary>
+        private async Task ReportLockProgress(string lockReason)
+        {
+            if (_viewModel.IsLocked is false)
+            {
+                return;
+            }
+
+            UpdateLockWindow(lockReason);
+            await YieldToLockWindow();
         }
 
         private async Task<UpdateCache?> GetCachedModUpdates(List<Mod> mods, bool skipCacheCheck = false)
         {
             int modsToUpdate = 0;
             UpdateCache? oldUpdateCache = null;
+            // Load client data once so we can consult and update ignored mappings
+            ClientData? cachedClient = null;
+            try
+            {
+                if (File.Exists(Pathing.GetDataCachePath()))
+                {
+                    cachedClient = JsonSerializer.Deserialize<ClientData>(File.ReadAllText(Pathing.GetDataCachePath()), new JsonSerializerOptions { AllowTrailingCommas = true });
+                }
+            }
+            catch
+            {
+                cachedClient = null;
+            }
+
+            // Cached update data is never applied to a collection mod, as its collection owns the version. The cache
+            // is keyed by unique ID alone, which a collection copy can share with a loose copy
+            mods = mods.Where(m => m.IsFromCollection is false).ToList();
+
+            // Applied ahead of the version cache rather than inside the loop over it. An ignore lives in the client
+            // data cache and has no dependency on the mod having a version cache entry, so gating it behind one lost
+            // the ignore whenever the entry was missing
+            if (cachedClient is not null && cachedClient.IgnoredUpdates is not null)
+            {
+                foreach (var modItem in mods)
+                {
+                    if (String.IsNullOrEmpty(modItem.IgnoredVersion) && cachedClient.IgnoredUpdates.TryGetValue(modItem.UniqueId, out string? ignoredVersion))
+                    {
+                        modItem.IgnoredVersion = ignoredVersion;
+                    }
+                }
+            }
 
             if (File.Exists(Pathing.GetVersionCachePath()))
             {
@@ -1836,19 +2474,45 @@ namespace Stardrop.Views
                             continue;
                         }
 
-                        if (modItem.IsModOutdated(modUpdateInfo.SuggestedVersion))
+                        // If an ignored version exists but a newer suggested version is now available, clear the ignored mapping
+                        if (!String.IsNullOrEmpty(modItem.IgnoredVersion))
                         {
-                            modItem.UpdateUri = modUpdateInfo.Link;
-                            modItem.SuggestedVersion = modUpdateInfo.SuggestedVersion;
-                            modItem.Status = modUpdateInfo.Status;
+                            try
+                            {
+                                if (!String.IsNullOrEmpty(modUpdateInfo.SuggestedVersion) && Semver.SemVersion.TryParse(modUpdateInfo.SuggestedVersion, Semver.SemVersionStyles.Any, out var suggested) && Semver.SemVersion.TryParse(modItem.IgnoredVersion, Semver.SemVersionStyles.Any, out var ignoredVer))
+                                {
+                                    if (suggested.CompareSortOrderTo(ignoredVer) > 0)
+                                    {
+                                        // Newer version found, remove ignored mapping
+                                        try
+                                        {
+                                            if (cachedClient is not null && cachedClient.IgnoredUpdates is not null && cachedClient.IgnoredUpdates.ContainsKey(modItem.UniqueId))
+                                            {
+                                                cachedClient.IgnoredUpdates.Remove(modItem.UniqueId);
+                                                File.WriteAllText(Pathing.GetDataCachePath(), JsonSerializer.Serialize(cachedClient, new JsonSerializerOptions() { WriteIndented = true }));
+                                            }
+                                        }
+                                        catch { }
 
-                            modsToUpdate++;
+                                        modItem.IgnoredVersion = null;
+                                    }
+                                }
+                            }
+                            catch
+                            {
+                                // ignore parsing errors
+                            }
                         }
-                        if (modUpdateInfo.Status != WikiCompatibilityStatus.Unknown && modUpdateInfo.Status != WikiCompatibilityStatus.Ok)
+
+                        // Applied whether or not the update is ignored, so an ignored mod can report the ignore
+                        // rather than reading as though nothing was ever found for it. Leaving it out of the count is HasAvailableUpdate's job, not this assignment's
+                        modItem.UpdateUri = modUpdateInfo.Link;
+                        modItem.SuggestedVersion = modUpdateInfo.SuggestedVersion;
+                        modItem.Status = modUpdateInfo.Status;
+
+                        if (modItem.HasAvailableUpdate)
                         {
-                            modItem.UpdateUri = modUpdateInfo.Link;
-                            modItem.SuggestedVersion = modUpdateInfo.SuggestedVersion;
-                            modItem.Status = modUpdateInfo.Status;
+                            modsToUpdate++;
                         }
                     }
                 }
@@ -1876,12 +2540,7 @@ namespace Stardrop.Views
                 Program.helper.Log($"Attempting to check for mod updates {(useCache ? "via cache" : "via smapi.io")}");
                 _viewModel.IsCheckingForUpdates = true;
 
-                // Close the menu, as it will remain open until the process is complete
-                var mainMenu = this.FindControl<Menu>("mainMenu");
-                if (mainMenu.IsOpen)
-                {
-                    mainMenu.Close();
-                }
+                CloseMainMenu();
 
                 // Update the status to let the user know the update is polling
                 _viewModel.UpdateStatusText = Program.translation.Get("ui.main_window.button.update_status.updating");
@@ -1915,6 +2574,10 @@ namespace Stardrop.Views
                     }
                     else
                     {
+                        // Dropped ahead of the dialog rather than left to the caller, as a lock window sitting under
+                        // a message the user has to answer reads as though Stardrop is still working
+                        SetLockState(false);
+
                         await CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.unable_to_locate_log"), _viewModel.Version), Program.translation.Get("internal.ok"));
                         Program.helper.Log($"Unable to locate SMAPI-latest.txt", Helper.Status.Alert);
 
@@ -1925,6 +2588,8 @@ namespace Stardrop.Views
 
                 if (Program.settings.GameDetails is null || String.IsNullOrEmpty(Program.settings.GameDetails.SmapiVersion))
                 {
+                    SetLockState(false);
+
                     await CreateWarningWindow(String.Format(Program.translation.Get("ui.warning.unable_to_read_log"), _viewModel.Version), Program.translation.Get("internal.ok"));
                     Program.helper.Log($"SMAPI started but Stardrop was unable to read SMAPI-latest.txt. Mods will not be checked for updates.", Helper.Status.Alert);
 
@@ -1944,8 +2609,15 @@ namespace Stardrop.Views
 
                 int modsToUpdate = 0;
                 var updateCache = useCache && oldUpdateCache is not null ? oldUpdateCache : new UpdateCache(DateTime.Now);
+
+                await ReportLockProgress(Program.translation.Get("ui.warning.mod_update_checking"));
                 var modUpdateData = await SMAPI.GetModUpdateData(Program.settings.GameDetails, mods);
-                foreach (var modItem in mods)
+
+                await ReportLockProgress(Program.translation.Get("ui.warning.mod_update_applying"));
+
+                // The full list still goes to GetModUpdateData so requirement names keep resolving, but only mods
+                // outside a collection take update data back out of it
+                foreach (var modItem in mods.Where(m => m.IsFromCollection is false))
                 {
                     var updateLink = String.Empty;
                     var modPageLink = String.Empty;
@@ -1963,8 +2635,6 @@ namespace Stardrop.Views
                             status = metaData.CompatibilityStatus;
                         }
                         recommendedVersion = suggestedUpdateData.Version;
-
-                        modsToUpdate++;
                     }
                     else if (metaData is not null && metaData.CompatibilityStatus != WikiCompatibilityStatus.Unknown && metaData.CompatibilityStatus != ModEntryMetadata.WikiCompatibilityStatus.Ok)
                     {
@@ -1973,8 +2643,6 @@ namespace Stardrop.Views
                         {
                             updateLink = metaData.Unofficial.Url;
                             recommendedVersion = metaData.Unofficial.Version;
-
-                            modsToUpdate++;
                         }
                         else if (metaData.Main is not null)
                         {
@@ -1998,9 +2666,28 @@ namespace Stardrop.Views
                     modItem.SuggestedVersion = recommendedVersion;
                     modItem.Status = status;
 
-                    if (!String.IsNullOrEmpty(modItem.ParsedStatus))
+                    // Counted off the mod rather than off the response, so this pass and the version cache report
+                    // the same number. Reading it from the response counted suggestions that were not actually
+                    // newer than the installed version, counted an ignored unofficial update and missed a newer
+                    // main version on a mod flagged as anything other than Ok
+                    if (modItem.HasAvailableUpdate)
                     {
-                        Program.helper.Log($"Update available for {modItem.UniqueId} (v{modItem.SuggestedVersion}): {modItem.UpdateUri}");
+                        modsToUpdate++;
+                    }
+
+                    // Deliberately not gated on ParsedStatus, which goes empty for an ignored update. Gating the
+                    // cache write on it dropped the very entry the ignore is later compared against, so a manual
+                    // check silently lost the ignore. Mirrors what ParsedStatus reports before that suppression
+                    bool hasUpdateData = modItem.HasNewerVersion || modItem.Status == WikiCompatibilityStatus.Broken;
+                    if (hasUpdateData)
+                    {
+                        // An ignored update is not one to report. Checked directly rather than through
+                        // ParsedStatus, which now reports the ignore instead of coming back empty
+                        if (modItem.IsUpdateIgnored is false)
+                        {
+                            Program.helper.Log($"Update available for {modItem.UniqueId} (v{modItem.SuggestedVersion}): {modItem.UpdateUri}");
+                        }
+
                         if (updateCache.Mods.FirstOrDefault(m => m.UniqueId.Equals(modItem.UniqueId)) is ModUpdateInfo modInfo && modInfo is not null)
                         {
                             modInfo.SuggestedVersion = recommendedVersion;
@@ -2063,9 +2750,21 @@ namespace Stardrop.Views
             _viewModel.IsCheckingForUpdates = false;
         }
 
+        /// <summary>Reapplies the visibility of columns that depend on a Nexus connection</summary>
+        private void RefreshGatedColumns(bool isNexusConnected)
+        {
+            var modGrid = this.FindControl<DataGrid>("modGrid");
+            if (modGrid is null)
+            {
+                return;
+            }
+
+            _viewModel.RefreshGatedColumns(modGrid, isNexusConnected);
+        }
+
         private async Task CheckForNexusConnection()
         {
-            // Create the client, and open access to Nexus if we haven't already done it
+            // Create the client and open access to Nexus if we haven't already done it
             await SetupNexusConnection(Nexus.GetCachedKey());
 
             Program.helper.Log($"Attempting to check for Nexus Mods connection (Has valid client: {Nexus.Client is not null})");
@@ -2089,6 +2788,9 @@ namespace Stardrop.Views
                 // Show endorsements
                 _viewModel.ShowEndorsements = true;
 
+                // Open the gate on Nexus only columns, which restores whatever the user last chose for them
+                RefreshGatedColumns(true);
+
                 // Show thumbnails
                 if (Program.settings.ShowModThumbnails)
                 {
@@ -2097,6 +2799,10 @@ namespace Stardrop.Views
 
                 // Show Nexus mod download column, if user is premium
                 _viewModel.ShowInstalls = Program.settings.NexusDetails.IsPremium;
+
+                // Check the installed collections for a newer revision. Awaited rather than fired off, so the count
+                // it produces is in place before anything reads it
+                await CheckForCollectionUpdates();
             }
             else
             {
@@ -2132,6 +2838,7 @@ namespace Stardrop.Views
                 _viewModel.NexusStatus = Program.translation.Get("internal.disconnected");
                 _viewModel.ShowEndorsements = false;
                 _viewModel.ShowInstalls = false;
+                RefreshGatedColumns(false);
             }
 
             if (newClient is not null)
@@ -2139,17 +2846,57 @@ namespace Stardrop.Views
                 newClient.DailyRequestLimitsChanged += NexusDailyLimitsChanged;
 
                 // Verify NXM protocol usage
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && NXMProtocol.Validate(Program.executablePath) is false)
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    var requestWindow = new MessageWindow(Program.translation.Get("ui.message.confirm_nxm_association"));
-                    if (await requestWindow.ShowDialog<bool>(this))
-                    {
-                        if (NXMProtocol.Register(Program.executablePath) is false)
-                        {
-                            await new WarningWindow(Program.translation.Get("ui.warning.failed_to_set_association"), Program.translation.Get("internal.ok")).ShowDialog(this);
-                        }
-                    }
+                    await VerifyNXMAssociation();
                 }
+            }
+        }
+
+        /// <summary>
+        /// Checks how Windows will actually route NXM links, then repairs or reports Stardrop's registration as needed.
+        /// </summary>
+        [SupportedOSPlatform("windows")]
+        private async Task VerifyNXMAssociation()
+        {
+            NXMAssociationState state = NXMProtocol.GetState(Program.executablePath);
+            if (state.Status is NXMAssociationStatus.Registered)
+            {
+                return;
+            }
+
+            if (state.Status is NXMAssociationStatus.Incomplete)
+            {
+                Program.helper.Log($"Repairing Stardrop's incomplete NXM protocol registration");
+                if (NXMProtocol.Register(Program.executablePath) is false)
+                {
+                    Program.helper.Log($"Failed to repair Stardrop's NXM protocol registration", Helper.Status.Alert);
+                }
+
+                return;
+            }
+
+            if (state.Status is NXMAssociationStatus.Overridden && state.IsStardropRegistered)
+            {
+                Program.helper.Log($"NXM links are currently handled by {state.HandlerName} (ProgId: {state.UserChoiceProgId}) rather than Stardrop", Helper.Status.Warning);
+                return;
+            }
+
+            var requestWindow = new MessageWindow(Program.translation.Get("ui.message.confirm_nxm_association"));
+            if (await requestWindow.ShowDialog<bool>(this) is false)
+            {
+                return;
+            }
+
+            if (NXMProtocol.Register(Program.executablePath) is false)
+            {
+                await new WarningWindow(Program.translation.Get("ui.warning.failed_to_set_association"), Program.translation.Get("internal.ok")).ShowDialog(this);
+                return;
+            }
+
+            if (state.Status is NXMAssociationStatus.Overridden)
+            {
+                await new WarningWindow(String.Format(Program.translation.Get("ui.warning.nxm_association_overridden"), state.HandlerName), Program.translation.Get("internal.ok")).ShowDialog(this);
             }
         }
 
@@ -2176,7 +2923,9 @@ namespace Stardrop.Views
         {
             foreach (var requirement in mod.Requirements.Where(r => r.IsRequired))
             {
-                var requiredMod = _viewModel.Mods.FirstOrDefault(m => m.UniqueId.Equals(requirement.UniqueID, StringComparison.OrdinalIgnoreCase));
+                // Resolved within the mod's own source first, so a collection mod enables the copy of the
+                // dependency that will actually load alongside it rather than an identically named loose one
+                var requiredMod = _viewModel.ResolveRequirement(mod, requirement.UniqueID);
                 if (requiredMod is not null)
                 {
                     requiredMod.IsEnabled = true;
@@ -2193,15 +2942,14 @@ namespace Stardrop.Views
         /// <param name="mod">The mod to look for in requirements.</param>
         private void DisableRequirements(Mod mod)
         {
-            foreach (var childMod in _viewModel.Mods.Where(m => m.Requirements.Any(r => r.IsRequired && r.UniqueID.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase))))
+            // Only the mods that would actually load this copy. Matching on the unique ID alone would disable
+            // everything depending on an identically named mod in another collection, or on a loose install
+            foreach (var childMod in _viewModel.GetDependents(mod))
             {
-                if (childMod is not null)
-                {
-                    childMod.IsEnabled = false;
+                childMod.IsEnabled = false;
 
-                    // Disable the requirement's requirements
-                    DisableRequirements(childMod);
-                }
+                // Disable the requirement's requirements
+                DisableRequirements(childMod);
             }
         }
 
@@ -2216,15 +2964,21 @@ namespace Stardrop.Views
             _viewModel.HideRequiredMods();
 
             // Update the profile's enabled mods
-            _editorView.UpdateProfile(profile, _viewModel.Mods.Where(m => m.IsEnabled).Select(m => m.UniqueId).ToList());
+            _editorView.UpdateProfile(profile, _viewModel.Mods);
 
-            // Update the EnabledModCount
-            _viewModel.EnabledModCount = _viewModel.Mods.Where(m => m.IsEnabled && !m.IsHidden).Count();
+            _viewModel.RefreshModCounts();
         }
 
         private async Task<string?> InstallModViaNexus(Mod mod)
         {
             if (mod is null || mod.InstallState != InstallState.Unknown)
+            {
+                return null;
+            }
+
+            // A collection owns the versions of the mods it installs, so updating one here would put the profile out
+            // of step with what the collection pins
+            if (mod.IsFromCollection is true)
             {
                 return null;
             }
@@ -2321,9 +3075,20 @@ namespace Stardrop.Views
             }
         }
 
-        private async Task<List<Mod>> AddMods(string[]? filePaths)
+        /// <summary>
+        /// Installs the mods contained in the given archives.
+        /// </summary>
+        /// <param name="filePaths">Archives to install from</param>
+        /// <param name="installPathOverride">Where to install to. Defaults to Settings.ModInstallPath</param>
+        /// <param name="installedModsByArchive">When supplied, is filled with the mods each archive produced. A single archive can hold several mods, so each entry is a list</param>
+        /// <param name="replaceWithoutAsking">
+        /// Skips the prompt over how to handle a mod already installed at the target and always clears the previous
+        /// copy first. Used by the collection paths, where the collection decides the version and the user has
+        /// already agreed to it, so asking once per mod would be dozens of prompts with one possible answer.
+        /// </param>
+        private async Task<List<Mod>> AddMods(string[]? filePaths, string? installPathOverride = null, IDictionary<string, List<Mod>>? installedModsByArchive = null, bool replaceWithoutAsking = false)
         {
-            Guid request = new Guid();
+            Guid request = Guid.NewGuid();
 
             // Wait until current lock is finished before doing further installs
             Program.helper.Log($"Add mods request received ({request}): Pending");
@@ -2360,13 +3125,17 @@ namespace Stardrop.Views
                 try
                 {
                     // Extract the archive data
-                    using (var archive = ArchiveFactory.Open(fileFullName))
+                    // TODO refactor this to use async
+                    using (var archive = ArchiveFactory.OpenArchive(fileFullName))
                     {
                         Dictionary<string, Manifest?> pathToManifests = new Dictionary<string, Manifest?>();
-                        foreach (var manifest in archive.Entries.Where(e => Path.GetFileName(e.Key).Equals("manifest.json", StringComparison.OrdinalIgnoreCase)))
+                        foreach (var manifest in archive.Entries.Where(e => Path.GetFileName(e.Key)!.Equals("manifest.json", StringComparison.OrdinalIgnoreCase)))
                         {
-                            Program.helper.Log(manifest.Key);
-                            pathToManifests[manifest.Key] = await ManifestParser.GetDataAsync(manifest);
+                            if (manifest.Key is not null)
+                            {
+                                Program.helper.Log(manifest.Key);
+                                pathToManifests[manifest.Key] = await ManifestParser.GetDataAsync(manifest);
+                            }
                         }
 
                         // Warn and skip the install logic if the given archive has no manifest.json
@@ -2378,10 +3147,10 @@ namespace Stardrop.Views
 
                         // If this is a mod update and if the Manifest.UpdateCautionMessage has a value, display message (and confirm if user wants to continue with mod update)
                         bool shouldProceedWithUpdate = true;
-                        foreach (var manifest in pathToManifests.Values.Where(m => m is not null && HasModInstalled(m.UniqueID) is true && string.IsNullOrEmpty(m.UpdateCautionMessage) is false))
+                        foreach (var manifest in pathToManifests.Values.Where(m => m is not null && _viewModel.HasModInstalled(m.UniqueID) is true && string.IsNullOrEmpty(m.UpdateCautionMessage) is false))
                         {
                             var requestWindow = new MessageWindow(String.Format(Program.translation.Get("ui.message.confirm_mod_update_caution"), manifest!.Name, manifest!.UpdateCautionMessage)) { Topmost = true };
-                            if (await requestWindow.ShowDialog<bool>(this) is false)
+                            if (await ShowDialogOverLock<bool>(requestWindow) is false)
                             {
                                 Program.helper.Log($"User elected to skip mod update due to given Manifest.UpdateCautionMessage message for mod {manifest!.UniqueID}:{manifest!.UpdateCautionMessage}");
                                 shouldProceedWithUpdate = false;
@@ -2396,7 +3165,7 @@ namespace Stardrop.Views
                         }
 
                         int currentManifestIndex = 1;
-                        bool alwaysAskToDelete = Program.settings.AlwaysAskToDelete;
+                        bool alwaysAskToDelete = Program.settings.AlwaysAskToDelete && replaceWithoutAsking is false;
                         foreach (var manifestPath in pathToManifests.Keys)
                         {
                             var manifest = pathToManifests[manifestPath];
@@ -2405,8 +3174,12 @@ namespace Stardrop.Views
                             bool isUpdate = false;
                             if (manifest is not null)
                             {
-                                var installPath = Program.settings.ModInstallPath;
-                                if (_viewModel.Mods.FirstOrDefault(m => m.UniqueId.Equals(manifest.UniqueID, StringComparison.OrdinalIgnoreCase)) is Mod mod && mod is not null && mod.ModFileInfo.Directory is not null)
+                                var installPath = String.IsNullOrEmpty(installPathOverride) ? Program.settings.ModInstallPath : installPathOverride;
+
+                                // Only treat this as an update of a mod from the same source, otherwise installing a
+                                // collection would overwrite the user's loose copy of the same mod
+                                var targetSourceId = Pathing.GetCollectionSourceId(installPath);
+                                if (_viewModel.Mods.FirstOrDefault(m => m.UniqueId.Equals(manifest.UniqueID, StringComparison.OrdinalIgnoreCase) && String.Equals(m.SourceId, targetSourceId, StringComparison.OrdinalIgnoreCase)) is Mod mod && mod is not null && mod.ModFileInfo.Directory is not null)
                                 {
                                     if (manifest.DeleteOldVersion is false && alwaysAskToDelete is true)
                                     {
@@ -2424,7 +3197,7 @@ namespace Stardrop.Views
                                         {
                                             Topmost = true
                                         };
-                                        Choice response = await requestWindow.ShowDialog<Choice>(this);
+                                        Choice response = await ShowDialogOverLock<Choice>(requestWindow);
                                         if (response == Choice.First || response == Choice.Second)
                                         {
                                             if (response == Choice.Second)
@@ -2453,12 +3226,15 @@ namespace Stardrop.Views
                                     isUpdate = true;
                                     installPath = mod.ModFileInfo.Directory.FullName;
 
-                                    // Set the LastUpdateTimestamp
-                                    if (localDataCache.ModInstallData is not null && localDataCache.ModInstallData.Any(m => m.UniqueId.Equals(manifest.UniqueID, StringComparison.OrdinalIgnoreCase)))
+                                    // Set the LastUpdateTimestamp. Skipped for a collection's mod, where the date
+                                    // would say when Stardrop last rewrote the folder rather than anything the user
+                                    // did, and would read as a gap beside the entries an update left alone. The
+                                    // collection's revision is what answers whether such a mod is current
+                                    if (mod.IsFromCollection is false && localDataCache.ModInstallData is not null && localDataCache.ModInstallData.FirstOrDefault(m => m.ToReference().Matches(mod)) is ModInstallData installData)
                                     {
                                         var updatedTimestamp = DateTime.Now;
                                         mod.LastUpdateTimestamp = updatedTimestamp;
-                                        localDataCache.ModInstallData.First(m => m.UniqueId.Equals(manifest.UniqueID, StringComparison.OrdinalIgnoreCase)).LastUpdateTimestamp = updatedTimestamp;
+                                        installData.LastUpdateTimestamp = updatedTimestamp;
                                     }
                                 }
                                 else if (String.IsNullOrEmpty(manifestPath.Replace("manifest.json", String.Empty, StringComparison.OrdinalIgnoreCase)))
@@ -2501,6 +3277,17 @@ namespace Stardrop.Views
                                     }
                                     outputPath = Regex.Replace(outputPath, @"\s+\/", "/");
 
+                                    // Entry keys are whatever the packer wrote, so they can hold characters this file
+                                    // system rejects or a segment aiming above the install path. Rebuilding the path
+                                    // below installPath keeps both out, at the cost of a folder named slightly differently
+                                    var safeOutputPath = Pathing.GetSafeDestinationPath(installPath, Path.GetRelativePath(installPath, outputPath));
+                                    if (String.IsNullOrEmpty(safeOutputPath))
+                                    {
+                                        Program.helper.Log($"Skipping {entry.Key}, as it does not resolve to a path inside {installPath}", Helper.Status.Warning);
+                                        continue;
+                                    }
+                                    outputPath = safeOutputPath;
+
                                     // Create the default location if it doesn't existe
                                     var outputFolder = Path.GetDirectoryName(outputPath);
                                     if (String.IsNullOrEmpty(outputFolder))
@@ -2519,7 +3306,21 @@ namespace Stardrop.Views
                                     }
                                 }
 
-                                addedMods.Add(new Mod(manifest, new FileInfo(Path.Join(installPath, manifestFolderPath)), manifest.UniqueID, manifest.Version, manifest.Name, manifest.Description, manifest.Author));
+                                // Built the same way the entries above were, so that it points at the folder they created
+                                var modFolderPath = Pathing.GetSafeDestinationPath(installPath, manifestFolderPath) ?? installPath;
+                                var addedMod = new Mod(manifest, new FileInfo(modFolderPath), manifest.UniqueID, manifest.Version, manifest.Name, manifest.Description, manifest.Author);
+                                addedMods.Add(addedMod);
+
+                                // Record which archive produced this mod, so callers do not have to guess afterwards
+                                if (installedModsByArchive is not null)
+                                {
+                                    if (installedModsByArchive.ContainsKey(fileFullName) is false)
+                                    {
+                                        installedModsByArchive[fileFullName] = new List<Mod>();
+                                    }
+
+                                    installedModsByArchive[fileFullName].Add(addedMod);
+                                }
                             }
                             else
                             {
@@ -2573,11 +3374,6 @@ namespace Stardrop.Views
             return addedMods;
         }
 
-        private bool HasModInstalled(string uniqueID)
-        {
-            return _viewModel.Mods.Any(m => m.UniqueId.Equals(uniqueID, StringComparison.OrdinalIgnoreCase));
-        }
-
         private void CreateDirectoryJunctions(List<string> arguments)
         {
             // Prepare the process
@@ -2629,31 +3425,68 @@ namespace Stardrop.Views
                 linkedModFolder.Delete(true);
             }
 
+            // Removed unconditionally, then written again below only where it has something to say. The setting can
+            // be turned off, the profile can stop holding collection mods, and either way a file left from a
+            // previous launch would keep suppressing checks nothing asked to suppress
+            TryDeleteSMAPIConfigOverride(enabledModsPath);
+
             string spacing = String.Concat(Environment.NewLine, "\t");
-            Program.helper.Log($"Creating links for the following enabled mods from profile {profile.Name}:{spacing}{String.Join(spacing, profile.EnabledModIds)}");
+            Program.helper.Log($"Creating links for the following enabled mods from profile {profile.Name}:{spacing}{String.Join(spacing, profile.EnabledModIds.Select(r => r.ToString()))}");
 
             // Link the enabled mods via a chained command
             List<string> arguments = new List<string>();
-            foreach (string modId in _viewModel.Mods.Where(m => m.IsEnabled).Select(m => m.UniqueId))
+            List<string> usedLinkNames = new List<string>();
+            List<string> linkedUniqueIds = new List<string>();
+
+            // Ordered so that a duplicated unique ID resolves to the copy this profile owns, as the guard below
+            // keeps whichever is reached first
+            var enabledMods = _viewModel.Mods.Where(m => m.IsEnabled).OrderByDescending(m => String.Equals(m.SourceId, profile.SourceId, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            // Collected from the copies that actually get linked rather than from everything enabled. SMAPI knows a
+            // mod only by its unique ID, so suppressing one the user is running loosely would hide an update they
+            // do want, and the guard below is what decides which copy SMAPI ends up seeing
+            var linkedCollectionIds = new List<string>();
+            foreach (var mod in enabledMods)
             {
-                var mod = _viewModel.Mods.FirstOrDefault(m => m.UniqueId == modId);
-                if (mod is null)
+                if (mod is null || mod.ModFileInfo is null || mod.ModFileInfo.Directory is null)
                 {
                     continue;
                 }
+
+                // The last gate before SMAPI. Two folders claiming one unique ID is an error SMAPI reports rather
+                // than resolves, and a profile saved while both copies were enabled still carries both
+                if (linkedUniqueIds.Any(id => id.Equals(mod.UniqueId, StringComparison.OrdinalIgnoreCase)))
+                {
+                    Program.helper.Log($"Skipping the link for {mod.Name} ({mod.ModFileInfo.DirectoryName}), as another copy of {mod.UniqueId} has already been linked", Helper.Status.Warning);
+                    continue;
+                }
+                linkedUniqueIds.Add(mod.UniqueId);
+
+                if (mod.IsFromCollection)
+                {
+                    linkedCollectionIds.Add(mod.UniqueId);
+                }
+
+                // SMAPI does not care about folder names, so a collision between a collection mod and a loose one can be resolved by suffixing
+                var linkName = mod.ModFileInfo.Directory.Name;
+                if (usedLinkNames.Any(n => n.Equals(linkName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    linkName = $"{linkName} ({(mod.IsFromCollection ? mod.SourceId : "local")})";
+                }
+                usedLinkNames.Add(linkName);
 
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
                     var longPathPrefix = @"\\?\";
 
-                    var linkPath = Path.Combine(enabledModsPath, mod.ModFileInfo.Directory.Name);
+                    var linkPath = Path.Combine(enabledModsPath, linkName);
                     if (linkPath.Length >= 260)
                     {
                         linkPath = longPathPrefix + linkPath;
                     }
 
                     var modDirectoryName = mod.ModFileInfo.DirectoryName;
-                    if (Path.Combine(enabledModsPath, mod.ModFileInfo.Directory.Name).Length >= 260)
+                    if (Path.Combine(enabledModsPath, linkName).Length >= 260)
                     {
                         modDirectoryName = longPathPrefix + modDirectoryName;
                     }
@@ -2663,7 +3496,7 @@ namespace Stardrop.Views
                 else
                 {
                     var edq = "\\\""; // Escaped double quotes, to prevent issues with paths that contain single quotes
-                    arguments.Add($"ln -sf {edq}{mod.ModFileInfo.DirectoryName}{edq} {edq}{Path.Combine(enabledModsPath, mod.ModFileInfo.Directory.Name)}{edq}");
+                    arguments.Add($"ln -sf {edq}{mod.ModFileInfo.DirectoryName}{edq} {edq}{Path.Combine(enabledModsPath, linkName)}{edq}");
                 }
             }
 
@@ -2703,7 +3536,56 @@ namespace Stardrop.Views
                 Program.helper.Log($"Failed to link all mod folders: {Environment.NewLine}{ex}");
             }
 
+            WriteSMAPIConfigOverride(enabledModsPath, linkedCollectionIds);
+
             Program.helper.Log($"Finished creating all linked mod folders");
+        }
+
+        /// <summary>
+        /// Writes the SMAPI-config.json that sits alongside the linked mods, listing the collection mods SMAPI
+        /// should leave out of its update checks. Stardrop already keeps these out of its own, since the collection
+        /// owns their versions, and SMAPI reporting an update the user is not meant to act on undoes that.
+        ///
+        /// This file rather than smapi-internal/config.json, which SMAPI resets on every update and which is shared
+        /// across profiles. The enabled mods folder is rebuilt from scratch on each launch, so a file written here
+        /// is scoped to the profile being started without anything having to keep it in step.
+        /// </summary>
+        private static void WriteSMAPIConfigOverride(string enabledModsPath, List<string> suppressedUniqueIds)
+        {
+            if (Program.settings.CollectionsSkipSMAPIUpdateCheck is false || suppressedUniqueIds.Count == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                // Only the one setting. SMAPI merges this over its defaults, so copying anything else across would
+                // pin values that are meant to follow whatever a future SMAPI ships
+                var overrides = new Dictionary<string, object>() { ["SuppressUpdateChecks"] = suppressedUniqueIds };
+
+                File.WriteAllText(Path.Combine(enabledModsPath, _smapiConfigOverrideName), JsonSerializer.Serialize(overrides, new JsonSerializerOptions() { WriteIndented = true }));
+                Program.helper.Log($"Told SMAPI to skip update checks for {suppressedUniqueIds.Count} collection mod(s)");
+            }
+            catch (Exception ex)
+            {
+                Program.helper.Log($"Unable to write {_smapiConfigOverrideName}, so SMAPI will check the collection's mods for updates: {ex}", Helper.Status.Warning);
+            }
+        }
+
+        private static void TryDeleteSMAPIConfigOverride(string enabledModsPath)
+        {
+            try
+            {
+                var configPath = Path.Combine(enabledModsPath, _smapiConfigOverrideName);
+                if (File.Exists(configPath))
+                {
+                    File.Delete(configPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.helper.Log($"Unable to clear the previous {_smapiConfigOverrideName}: {ex}", Helper.Status.Warning);
+            }
         }
 
         private void OpenNativeExplorer(string folderPath)
@@ -2771,7 +3653,7 @@ namespace Stardrop.Views
 
             // Change listener and intial value setter
             // Both of these need to have a .StartWith(), because a) CombineLatest() will never emit anything until both
-            // sources have emitted *something*, and b) this also ensures that we do intial value setting before 
+            // sources have emitted *something* and b) this also ensures that we do intial value setting before 
             // Downloads count or selected language otherwise changes.
             Observable.CombineLatest(
                 first: panelVM.InProgressDownloads.StartWith(0),
