@@ -46,6 +46,10 @@ struct NativeCollectionEntry: Identifiable, Codable, Sendable {
     var installedMods: [CollectionModReference] = []
     var isPinned: Bool { updatePolicy?.lowercased() == "exact" }
     var satisfied: Bool { !selected || status == .installed || status == .skipped }
+    func canReusePayload(from previous: NativeCollectionEntry) -> Bool {
+        // A bundle's expression identifies a path in its revision archive, not its contents.
+        source != .bundle && id == previous.id && previous.status == .installed
+    }
     var pageURL: URL? {
         if let modID, let fileID {
             return URL(string: "https://www.nexusmods.com/stardewvalley/mods/\(modID)?tab=files&file_id=\(fileID)&nmm=1")
@@ -172,6 +176,17 @@ struct NativeCollection: Identifiable, Codable, Sendable {
             latestRevision: metadata.revisionNumber, entries: entries, rules: rules)
         collection.resolveRequiredSelections()
         return collection
+    }
+
+    mutating func carryForwardSelections(from previous: NativeCollection) {
+        for index in entries.indices where entries[index].optional {
+            if let old = previous.entries.first(where: {
+                $0.id == entries[index].id || ($0.modID != nil && $0.modID == entries[index].modID)
+            }) {
+                entries[index].selected = old.selected
+            }
+        }
+        resolveRequiredSelections()
     }
 
     mutating func resolveRequiredSelections() {

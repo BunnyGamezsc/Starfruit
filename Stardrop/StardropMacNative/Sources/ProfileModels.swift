@@ -113,7 +113,9 @@ extension SharedProfileManifest {
     }
 
     static func decodePortable(_ data: Data) throws -> SharedProfileManifest {
-        if let native = try? JSONDecoder().decode(Self.self, from: data) {
+        let nativeDecoder = JSONDecoder()
+        nativeDecoder.dateDecodingStrategy = .iso8601
+        if let native = (try? nativeDecoder.decode(Self.self, from: data)) ?? (try? JSONDecoder().decode(Self.self, from: data)) {
             guard ["starfruit.profile.v1", "starfruit.profile.v2"].contains(native.format) else { throw CollectionError.invalid("Unsupported profile format.") }
             return native
         }

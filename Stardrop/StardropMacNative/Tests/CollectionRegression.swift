@@ -46,8 +46,11 @@ struct CollectionRegression {
         defer { try? FileManager.default.removeItem(at: temporary) }
         try models()
         try profiles()
+        try profileRoundTrips()
+        try revisions()
         try storage(temporary)
         try archives(temporary)
+        try groupedArchiveCollisions(temporary)
         print("Collection/profile/archive regressions passed (\(assertions) assertions; isolated temporary fixtures).")
     }
     static func models() throws {
@@ -178,6 +181,36 @@ struct CollectionRegression {
         try rejects("relocation cannot recurse into itself") { _ = try storage.relocated(to: storage.root.appendingPathComponent("Nested")) }
         try rejects("relocation cannot overwrite occupied folder") { _ = try storage.relocated(to: moved.root) }
     }
+    static func groupedArchiveCollisions(_ root: URL) throws {
+        let source = root.appendingPathComponent("GroupedArchiveSource")
+        _ = try mod(source, folder: "Group", id: "Author.New")
+        let archive = root.appendingPathComponent("Grouped.zip")
+        try run("/usr/bin/tar", ["-a", "-cf", archive.path, "-C", source.path, "."])
+        let destination = root.appendingPathComponent("GroupedMods")
+        _ = try mod(destination, folder: "Group/A", id: "Author.A", config: "saved-A")
+        _ = try mod(destination, folder: "Group/B", id: "Author.B", config: "saved-B")
+        _ = try CollectionStorage.installOrdinaryArchive(archive, destination: destination, protectedModIDs: ["author.a"])
+        try expect(Set(CollectionStorage.manifests(in: destination).map { $0.0.UniqueID }) == ["Author.A", "Author.B", "Author.New"], "group folder collision preserves unrelated and pinned nested mods")
+        try expect(try String(contentsOf: destination.appendingPathComponent("Group/A/config.json"), encoding: .utf8) == "saved-A", "nested mod config survives addon installation")
+        try expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent("Author.New/manifest.json").path), "group collision installs under unique ID instead")
+
+        let blocked = root.appendingPathComponent("BlockedGroupedMods")
+        _ = try mod(blocked, folder: "Group/A", id: "Author.A")
+        _ = try mod(blocked, folder: "Author.New/B", id: "Author.B")
+        try rejects("both archive name and unique ID containing unrelated mods are rejected") {
+            _ = try CollectionStorage.installOrdinaryArchive(archive, destination: blocked)
+        }
+        try expect(Set(CollectionStorage.manifests(in: blocked).map { $0.0.UniqueID }) == ["Author.A", "Author.B"], "rejected collision leaves both grouping folders intact")
+
+        let legacySource = root.appendingPathComponent("LegacyCollisionSource")
+        _ = try mod(legacySource, folder: "Collections", id: "Author.Loose")
+        let legacyArchive = root.appendingPathComponent("LegacyCollision.zip")
+        try run("/usr/bin/tar", ["-a", "-cf", legacyArchive.path, "-C", legacySource.path, "."])
+        _ = try mod(destination, folder: "Collections/Pack/Pinned", id: "Author.Legacy")
+        _ = try CollectionStorage.installOrdinaryArchive(legacyArchive, destination: destination)
+        try expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent("Collections/Pack/Pinned/manifest.json").path), "ordinary archive cannot replace excluded legacy collection tree")
+    }
+
     static func archives(_ root: URL) throws {
         let source = root.appendingPathComponent("ArchiveSource")
         _ = try mod(source, folder: "First", id: "Author.First", config: "archive-default", extra: "new.txt")

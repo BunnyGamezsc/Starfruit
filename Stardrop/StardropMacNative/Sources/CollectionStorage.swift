@@ -262,12 +262,19 @@ struct CollectionStorage: Sendable {
             _ = try NativeArchiveInstaller.safeFolderName(manifest.UniqueID)
             var name = try NativeArchiveInstaller.safeFolderName(folder == payload ? manifest.UniqueID : folder.lastPathComponent)
             let old = existing.filter { $0.0.UniqueID.caseInsensitiveCompare(manifest.UniqueID) == .orderedSame }
+            // Only a root owned by this same mod may be replaced. A grouping folder
+            // can contain other mods (including legacy collections) or user files.
+            func replacesUnrelatedFolder(_ target: URL) -> Bool {
+                manager.fileExists(atPath: target.path) && !old.contains {
+                    $0.1.standardizedFileURL.path.caseInsensitiveCompare(target.standardizedFileURL.path) == .orderedSame
+                }
+            }
             let initialTarget = destination.appendingPathComponent(name)
-            if existing.contains(where: { $0.1.standardizedFileURL.path.caseInsensitiveCompare(initialTarget.standardizedFileURL.path) == .orderedSame && $0.0.UniqueID.caseInsensitiveCompare(manifest.UniqueID) != .orderedSame }) || !used.insert(name.lowercased()).inserted {
+            if replacesUnrelatedFolder(initialTarget) || !used.insert(name.lowercased()).inserted {
                 name = manifest.UniqueID
                 guard used.insert(name.lowercased()).inserted else { throw CollectionError.invalid("The archive contains duplicate mod identifiers.") }
                 let fallback = destination.appendingPathComponent(name)
-                guard !existing.contains(where: { $0.1.standardizedFileURL.path.caseInsensitiveCompare(fallback.standardizedFileURL.path) == .orderedSame && $0.0.UniqueID.caseInsensitiveCompare(manifest.UniqueID) != .orderedSame }) else {
+                guard !replacesUnrelatedFolder(fallback) else {
                     throw CollectionError.invalid("The mod's folder conflicts with another installed mod. Rename its archive folder before installing.")
                 }
             }

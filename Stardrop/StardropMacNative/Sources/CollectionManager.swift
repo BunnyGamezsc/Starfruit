@@ -112,10 +112,10 @@ final class CollectionManager: ObservableObject {
             record.legacyModsDirectory = previous.legacyModsDirectory
             record.previousEntries = previous.installedRevision == previous.revision ? previous.entries : previous.previousEntries
             record.preserveRemovedMods = previous.preserveRemovedMods
+            record.carryForwardSelections(from: previous)
             for index in record.entries.indices {
                 if let old = previous.entries.first(where: { $0.id == record.entries[index].id || ($0.modID != nil && $0.modID == record.entries[index].modID) }) {
-                    record.entries[index].selected = old.selected
-                    if old.id == record.entries[index].id && old.status == .installed {
+                    if record.entries[index].canReusePayload(from: old) {
                         let oldPayload = try storage.revisionDirectory(previous).appendingPathComponent("Payloads/\(old.id)")
                         let newPayload = directory.appendingPathComponent("Payloads/\(old.id)")
                         if FileManager.default.fileExists(atPath: oldPayload.path), oldPayload != newPayload {

@@ -25,6 +25,8 @@ class ModManager: ObservableObject {
         }
     }
     @Published var profilePersistenceError: String?
+    @Published var trashedMods: [NativeTrashedMod] = []
+    @Published var modTrashError: String?
     @Published var collectionsSkipSMAPIUpdateCheck = UserDefaults.standard.object(forKey: "collectionsSkipSMAPIUpdateCheck") as? Bool ?? true {
         didSet { UserDefaults.standard.set(collectionsSkipSMAPIUpdateCheck, forKey: "collectionsSkipSMAPIUpdateCheck") }
     }
@@ -53,6 +55,10 @@ class ModManager: ObservableObject {
     /// Resolve one physical copy per logical mod ID, keeping a profile's source selection explicit.
     var modsForCurrentProfile: [ModEntry] {
         guard let profile = currentProfile else { return [] }
+        return mods(for: profile)
+    }
+
+    private func mods(for profile: ModProfile) -> [ModEntry] {
         let groups = Dictionary(grouping: mods, by: { $0.id.lowercased() })
         return groups.values.compactMap { copies -> ModEntry? in
             guard let first = copies.first else { return nil }
@@ -758,14 +764,49 @@ class ModManager: ObservableObject {
         }
         if changed { saveProfiles() }
     }
-    func deleteMod(modID: String, smapiDir: String, customModsDir: String) {
-        guard let mod = modsForCurrentProfile.first(where: { $0.id == modID }), mod.sourceID == nil else { return }
-        let fileManager = FileManager.default
+    func profilesUsingMod(_ mod: ModEntry) -> [ModProfile] {
+        profiles.filter { profile in
+            let enabled = isCoreMod(mod.id) || profile.enabledModIDs.contains { $0.caseInsensitiveCompare(mod.id) == .orderedSame }
+            return enabled && mods(for: profile).contains { $0.folderPath == mod.folderPath }
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func canTrashMod(_ mod: ModEntry) -> Bool {
+        mod.sourceID == nil && !isCoreMod(mod.id) && !(currentProfile?.isProtected ?? true)
+            && !isGameRunning && !isLaunching
+    }
+
+    func trashMod(_ mod: ModEntry) {
+        guard canTrashMod(mod), modsForCurrentProfile.contains(where: {
+            $0.id == mod.id && $0.folderPath == mod.folderPath && $0.sourceID == nil
+        }) else {
+            modTrashError = "This mod can no longer be moved to Trash. Refresh the mod list and make sure the game is stopped."
+            return
+        }
         do {
-            try fileManager.removeItem(atPath: mod.folderPath)
-            loadMods(smapiDir: smapiDir, customModsDir: customModsDir)
+            let root = getModDirectory(smapiDir: loadedSMAPIDir, customModsDir: loadedCustomModsDir)
+            let item = try NativeModTrash.moveToTrash(mod, modsDirectory: root)
+            trashedMods.append(item)
+            modTrashError = nil
+            reloadCurrentModDirectories()
         } catch {
-            print("Failed to delete mod: \(error)")
+            modTrashError = "Could not move \(mod.manifest.Name) to Trash: \(error.localizedDescription)"
+        }
+    }
+
+    func undoModTrash() {
+        guard let item = trashedMods.last else { return }
+        guard !isGameRunning && !isLaunching else {
+            modTrashError = "Stop the game before restoring a mod."
+            return
+        }
+        do {
+            try NativeModTrash.restore(item)
+            trashedMods.removeLast()
+            modTrashError = nil
+            reloadCurrentModDirectories()
+        } catch {
+            modTrashError = "Could not restore \(item.name): \(error.localizedDescription)"
         }
     }
 

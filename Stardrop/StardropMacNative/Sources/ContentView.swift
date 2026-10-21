@@ -6,7 +6,7 @@ struct ContentView: View {
     @ObservedObject private var themeManager = NativeThemeManager.shared
     @NativeState private var selection: String? = "mods"
     @NativeState private var isShowingOnboarding = false
-    @NativeState private var downloadsSearchQuery: String = ""
+    @StateObject private var downloadsSearch = NexusModSearchModel()
     @NativeState private var archiveImportError: String?
     @EnvironmentObject var modManager: ModManager
     @EnvironmentObject var nexusClient: NexusClient
@@ -50,7 +50,7 @@ struct ContentView: View {
                 } else if selection == "collections" {
                     CollectionsView()
                 } else if selection == "downloads" {
-                    DownloadPanelView(searchQuery: $downloadsSearchQuery)
+                    DownloadPanelView(search: downloadsSearch)
                         .starfruitPanel()
                         .padding()
                 } else {
@@ -62,10 +62,13 @@ struct ContentView: View {
             .background(Color.starfruitBackground)
             .frame(minWidth: 700, minHeight: 500)
             .searchable(text: Binding(get: {
-                selection == "downloads" ? downloadsSearchQuery : modManager.searchText
+                selection == "downloads" ? downloadsSearch.query : modManager.searchText
             }, set: { new in
-                if selection == "downloads" { downloadsSearchQuery = new } else { modManager.searchText = new }
+                if selection == "downloads" { downloadsSearch.query = new } else { modManager.searchText = new }
             }), prompt: "Search mods...")
+            .onSubmit(of: .search) {
+                if selection == "downloads" { downloadsSearch.submit() }
+            }
         }
         .onAppear {
             let smapiDir = useWine ? wineSmapiDir : nativeSmapiDir
@@ -223,6 +226,7 @@ struct ModsListView: View {
     @NativeState private var renamedProfileName = ""
     @NativeState private var notesMod: ModEntry?
     @NativeState private var changelogMod: ModEntry?
+    @NativeState private var modToTrash: ModEntry?
     @NativeState private var showUpdatesOnly = false
 
     var body: some View {
@@ -261,14 +265,9 @@ struct ModsListView: View {
                         }
                     }
                 } label: {
-                    HStack {
-                        Text(nativeLocalized("Profile: "))
-                        Text(modManager.profiles.first(where: { $0.id == modManager.selectedProfileID })?.name ?? "None")
-                            .foregroundColor(.starfruitAccent)
-                            .bold()
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.caption)
-                    }
+                    // Native macOS menus can use only the first Text in a custom
+                    // label. Keep the prefix and selected name in one title.
+                    Text(nativeLocalized("Profile: ") + (modManager.currentProfile?.name ?? nativeLocalized("None")))
                 }
                 .menuStyle(.borderlessButton)
 
@@ -360,7 +359,12 @@ struct ModsListView: View {
                     .font(.caption).foregroundColor(.secondary).padding(.horizontal)
             }
             listControls
+            NativeModTrashNotice()
             modListPanel
+        }
+        .sheet(item: $modToTrash) { mod in
+            NativeModTrashConfirmation(mod: mod)
+                .environmentObject(modManager)
         }
         .sheet(item: $notesMod) { mod in
             NativeModNotesEditor(modName: mod.manifest.Name, onSave: { note in
@@ -522,11 +526,10 @@ struct ModsListView: View {
                 Button(nativeLocalized("Open Config")) { NSWorkspace.shared.open(URL(fileURLWithPath: mod.folderPath).appendingPathComponent("config.json")) }
             }
             Divider()
-            Button(nativeLocalized("Delete Mod"), role: .destructive) {
-                modManager.deleteMod(modID: mod.id, smapiDir: useWine ? wineSmapiDir : nativeSmapiDir,
-                                     customModsDir: useWine ? wineModsDir : nativeModsDir)
+            Button(nativeLocalized("Move to Trash…"), role: .destructive) {
+                modToTrash = mod
             }
-            .disabled(modManager.currentProfile?.isProtected ?? false)
+            .disabled(!modManager.canTrashMod(mod))
         }
     }
 
@@ -1040,34 +1043,11 @@ struct OnboardingView: View {
     }
 }
 
-struct NexusSearchResult: Codable, Identifiable {
-    var id: Int { mod_id }
-    let name: String
-    let mod_id: Int
-    let game_id: Int?
-    let author: String?
-    let downloads: Int?
-    let endorsements: Int?
-    let summary: String?
-    let url: String?
-    let thumb_url: String?
-}
-
-struct NexusSearchResponse: Codable {
-    let total: Int?
-    let terms: [String]?
-    let results: [NexusSearchResult]?
-}
-
 struct DownloadPanelView: View {
     @ObservedObject private var localization = NativeLocalization.shared
     @ObservedObject private var themeManager = NativeThemeManager.shared
     @EnvironmentObject var downloadManager: DownloadManager
-    @Binding var searchQuery: String
-    @NativeState private var searchResults: [NexusSearchResult] = []
-    @NativeState private var isSearching = false
-    @NativeState private var searchError: String? = nil
-    @NativeState private var hasSearched = false
+    @ObservedObject var search: NexusModSearchModel
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1091,26 +1071,24 @@ struct DownloadPanelView: View {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(.starfruitBorder)
-                TextField("Search Nexus Mods for Stardew Valley...", text: $searchQuery)
+                TextField("Search Nexus Mods for Stardew Valley...", text: $search.query)
                     .textFieldStyle(.plain)
-                    .onSubmit { performSearch() }
-                if isSearching {
+                    .onSubmit { search.submit() }
+                if search.isSearching {
                     ProgressView().controlSize(.small)
-                } else if !searchQuery.isEmpty {
+                }
+                if !search.query.isEmpty {
                     Button(action: {
-                        searchQuery = ""
-                        searchResults = []
-                        hasSearched = false
-                        searchError = nil
+                        search.query = ""
                     }) {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundColor(.secondary)
                     }
                     .buttonStyle(.plain)
                 }
-                Button(nativeLocalized("Search")) { performSearch() }
+                Button(nativeLocalized("Search")) { search.submit() }
                     .buttonStyle(StarfruitButtonStyle())
-                    .disabled(searchQuery.trimmingCharacters(in: .whitespaces).isEmpty || isSearching)
+                    .disabled(search.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || search.isSearching)
             }
             .padding(.horizontal)
             .padding(.vertical, 10)
@@ -1141,7 +1119,7 @@ struct DownloadPanelView: View {
                     }
 
                     // Search results section
-                    if let error = searchError {
+                    if let error = search.error {
                         VStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle")
                                 .font(.title2)
@@ -1153,30 +1131,30 @@ struct DownloadPanelView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
-                    } else if hasSearched && searchResults.isEmpty && !isSearching {
+                    } else if search.hasSearched && search.results.isEmpty && !search.isSearching {
                         VStack(spacing: 8) {
                             Image(systemName: "questionmark.circle")
                                 .font(.title2)
                                 .foregroundColor(.secondary)
-                            Text("No mods found for \"\(searchQuery)\"")
+                            Text("No mods found for \"\(search.query)\"")
                                 .foregroundColor(.secondary)
                                 .font(.caption)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
-                    } else if !searchResults.isEmpty {
+                    } else if !search.results.isEmpty {
                         VStack(alignment: .leading, spacing: 0) {
-                            Text("\(searchResults.count) result\(searchResults.count == 1 ? "" : "s") on Nexus Mods")
+                            Text("\(search.results.count) result\(search.results.count == 1 ? "" : "s") on Nexus Mods")
                                 .font(.caption.bold())
                                 .foregroundColor(.starfruitBorder)
                                 .padding(.horizontal)
                                 .padding(.top, 12)
                                 .padding(.bottom, 6)
-                            ForEach(searchResults) { result in
+                            ForEach(search.results) { result in
                                 NexusSearchResultRow(result: result)
                             }
                         }
-                    } else if !hasSearched && downloadManager.activeDownloads.isEmpty {
+                    } else if !search.hasSearched && downloadManager.activeDownloads.isEmpty {
                         VStack(spacing: 10) {
                             Image(systemName: "arrow.down.to.line.circle")
                                 .font(.system(size: 40))
@@ -1195,49 +1173,7 @@ struct DownloadPanelView: View {
                 }
             }
         }
-    }
-
-    private func performSearch() {
-        let query = searchQuery.trimmingCharacters(in: .whitespaces)
-        guard !query.isEmpty else { return }
-        isSearching = true
-        searchError = nil
-        searchResults = []
-
-        Task {
-            do {
-                // Nexus public search — no API key required
-                var components = URLComponents(string: "https://search.nexusmods.com/mods")!
-                components.queryItems = [
-                    URLQueryItem(name: "terms", value: query),
-                    URLQueryItem(name: "game_id", value: "1303"), // Stardew Valley game ID
-                    URLQueryItem(name: "blocked_tags", value: ""),
-                    URLQueryItem(name: "blocked_authors", value: ""),
-                    URLQueryItem(name: "include_adult", value: "0")
-                ]
-                guard let url = components.url else { throw URLError(.badURL) }
-
-                var request = URLRequest(url: url)
-                request.setValue("Mozilla/5.0 Starfruit/1.0", forHTTPHeaderField: "User-Agent")
-
-                let (data, response) = try await URLSession.shared.data(for: request)
-                guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                    throw URLError(.badServerResponse)
-                }
-                let decoded = try JSONDecoder().decode(NexusSearchResponse.self, from: data)
-                await MainActor.run {
-                    searchResults = decoded.results ?? []
-                    hasSearched = true
-                    isSearching = false
-                }
-            } catch {
-                await MainActor.run {
-                    searchError = "Search failed: \(error.localizedDescription)"
-                    hasSearched = true
-                    isSearching = false
-                }
-            }
-        }
+        .onDisappear { search.cancel() }
     }
 }
 
@@ -1289,11 +1225,7 @@ struct NexusSearchResultRow: View {
     }
 
     private func openOnNexus() {
-        let urlString = result.url
-            ?? "https://www.nexusmods.com/stardewvalley/mods/\(result.mod_id)"
-        if let url = URL(string: urlString) {
-            NSWorkspace.shared.open(url)
-        }
+        NSWorkspace.shared.open(result.pageURL)
     }
 
     private func formatCount(_ n: Int) -> String {

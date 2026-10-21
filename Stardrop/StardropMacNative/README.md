@@ -22,15 +22,17 @@ for local development ad-hoc signing. Running the script without
 The app supports macOS 13 or newer. The build uses the host architecture by default;
 set `BUILD_ARCHS="arm64 x86_64"` to create a universal macOS app.
 Distribution builds should provide increasing `APP_VERSION` and `APP_BUILD`
-values (the current defaults are 1.1.0, build 2).
+values (the current defaults are 1.1.1, build 3).
 The public update key is read from `sparkle-public-key.txt` and embedded
 as `SUPublicEDKey`; `SPARKLE_PUBLIC_ED_KEY` can override it for another channel.
 The default feed is the `appcast.xml` asset of the latest Starfruit GitHub release.
 `SPARKLE_FEED_URL` can select a different update feed.
 
 Run `bash Tests/run-regressions.sh` for isolated collection/profile/archive,
-mocked Nexus, input-callback and theme regression fixtures. They do not launch
+mod Trash/restore, mocked Nexus, input-callback and theme regression fixtures. They do not launch
 the app, post input events, access real Nexus credentials, or modify game mods.
+Trash fixtures move only uniquely named temporary mod folders to the macOS Trash
+and clean them up afterward.
 Builds and regression checks run locally. This repository has no GitHub Actions
 workflows, and standalone source exports do not include CI configuration.
 
@@ -56,6 +58,17 @@ release. The checked-in appcast is a placeholder, not the release feed.
 
 `BunnyGamezDev` is a self-signed certificate, not an Apple Developer ID or
 notarization. Its use matches Tokscale; it does not change Gatekeeper policy.
+
+## Removing mods
+
+Right-click an ordinary mod and choose **Move to Trash…** to review which profiles
+enable that installed copy before removing it. The entire folder, including its
+config, moves to the macOS Trash. Profile selections and notes remain intact.
+The Mods screen offers **Undo** for each removal in reverse order during the
+current app session. Undo restores the original folder and refuses to overwrite
+a replacement installed at the same location. After quitting Starfruit, recover
+the folder from Trash in Finder instead. Moving or restoring mods requires the
+game to be stopped; collection mods and SMAPI's built-in mods are protected.
 
 ## Translations
 

@@ -3,8 +3,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 bash Tests/run-network-input-regressions.sh
+bash Tests/run-search-regressions.sh
 bash Tests/run-collection-regressions.sh
 bash Tests/run-migration-regressions.sh
+bash Tests/run-mod-trash-regressions.sh
 
 TEST_OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp/}starfruit-theme.XXXXXX")"
 trap 'rm -rf "$TEST_OUTPUT_DIR"' EXIT
